@@ -1,0 +1,42 @@
+SOC incident report — sample for ioc-hunter testing
+====================================================
+
+Date: 2026-06-13
+Analyst: platinum2high
+Status: ongoing
+
+Summary
+-------
+
+User reports suspicious email with embedded link, followed by outbound
+beaconing from the workstation. Email forwarded to abuse@corp.
+
+Indicators of Compromise
+------------------------
+
+Sender:        bad[at]evil[.]com
+Phishing URL:  hxxps://evil[.]com/login.php
+Backup URL:    hxxps://evil[.]com/install.exe
+
+Beaconing IPs (TCP/443):
+  - 185[.]220[.]101[.]42    (Tor exit — confirmed via dig)
+  - 185[.]220[.]101[.]99    (same subnet as above)
+  - 8[.]8[.]8[.]8           (Google DNS — used by malware for connectivity check)
+
+Dropper hash (SHA256):
+  275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
+
+Exploit chain leverages CVE-2024-21762.
+
+Ransom note demands payment to 1BoatSLRHtKNngkdXEeobR76b53LETtpyT.
+
+Domain mentioned but not yet resolved: evil[.]com
+
+Notes
+-----
+
+* All URLs were defanged before pasting — ioc-hunter will refang them.
+* The two .101.x IPs should show up as correlated (shared /24 subnet).
+* The URL and the standalone domain `evil.com` should correlate via url_to_host.
+* SHA256 above is the canonical EICAR-equivalent test file — every AV
+  vendor recognizes it, so VirusTotal should give a strong verdict.
