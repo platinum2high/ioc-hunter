@@ -27,6 +27,7 @@ from ioc_hunter.core.types import IOCType
 from ioc_hunter.correlator import correlate as _correlate
 from ioc_hunter.engine import Engine
 from ioc_hunter.exporters import to_json, to_markdown, to_misp, to_stix
+from ioc_hunter.rules import to_sigma, to_suricata
 from ioc_hunter.scorer import IOCVerdict
 from ioc_hunter.sources import (
     AbuseIPDBSource,
@@ -251,6 +252,8 @@ _EXPORTERS = {
     "md": to_markdown,
     "stix": to_stix,
     "misp": to_misp,
+    "sigma": to_sigma,
+    "suricata": to_suricata,
 }
 
 
