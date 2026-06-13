@@ -25,6 +25,10 @@ from ioc_hunter.config import Settings
 from ioc_hunter.core import IOC, defang, detect_type, extract_iocs
 from ioc_hunter.core.types import IOCType
 from ioc_hunter.correlator import correlate as _correlate
+from ioc_hunter.decoder import OPERATIONS as _DECODE_OPS
+from ioc_hunter.decoder import DecodeError
+from ioc_hunter.decoder import decode as _decode_op
+from ioc_hunter.decoder import magic as _magic
 from ioc_hunter.engine import Engine
 from ioc_hunter.exporters import to_json, to_markdown, to_misp, to_stix
 from ioc_hunter.rules import to_sigma, to_suricata
@@ -361,6 +365,41 @@ def correlate(
 ) -> None:
     exit_code = asyncio.run(_run_correlate(path, use_cache=not no_cache))
     raise typer.Exit(exit_code)
+
+
+@app.command(help="Decode obfuscated input (base64, hex, URL, JWT, gzip, ...).")
+def decode(
+    text: str = typer.Argument(..., help="The encoded string."),
+    op: str | None = typer.Option(
+        None,
+        "--op",
+        "-o",
+        help=f"Force one operation. One of: {', '.join(sorted(_DECODE_OPS))}.",
+    ),
+) -> None:
+    if op:
+        try:
+            decoded = _decode_op(op, text)
+        except DecodeError as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(2) from None
+        console.print(Panel.fit(decoded, title=f"{op}", border_style="cyan"))
+        return
+
+    results = _magic(text)
+    if not results:
+        console.print("[yellow]No operation produced a valid decode.[/]")
+        raise typer.Exit(1)
+
+    table = Table(title=f"Magic decode — {len(results)} candidate(s)", box=SIMPLE)
+    table.add_column("Op", style="cyan")
+    table.add_column("Score", justify="right")
+    table.add_column("IOCs", justify="right")
+    table.add_column("Decoded", overflow="fold")
+    for r in results:
+        preview = r.decoded if len(r.decoded) <= 80 else r.decoded[:77] + "..."
+        table.add_row(r.operation, f"{r.score:.2f}", str(r.ioc_count), preview)
+    console.print(table)
 
 
 @app.command(help="List configured and unconfigured sources.")
