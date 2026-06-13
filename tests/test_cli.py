@@ -87,6 +87,14 @@ def test_check_with_malicious_verdict(patch_engine) -> None:
     assert "1[.]2[.]3[.]4" in result.stdout
 
 
+def test_check_accepts_defanged_input(patch_engine) -> None:
+    ioc = IOC(value="1.2.3.4", type=IOCType.IPV4)
+    patch_engine({"1.2.3.4": _verdict(ioc, Verdict.MALICIOUS, confidence=0.92)})
+    result = runner.invoke(cli.app, ["check", "1[.]2[.]3[.]4", "--no-cache"])
+    assert result.exit_code == 0
+    assert "MALICIOUS" in result.stdout
+
+
 def test_check_unparseable_ioc_returns_1(patch_engine) -> None:
     patch_engine({})
     result = runner.invoke(cli.app, ["check", "this is not an ioc", "--no-cache"])

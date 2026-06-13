@@ -16,13 +16,14 @@ import httpx
 import typer
 from rich.box import SIMPLE
 from rich.console import Console
+from rich.markup import escape as _escape_markup
 from rich.panel import Panel
 from rich.table import Table
 
 from ioc_hunter import __version__
 from ioc_hunter.cache import TICache
 from ioc_hunter.config import Settings
-from ioc_hunter.core import IOC, defang, detect_type, extract_iocs
+from ioc_hunter.core import IOC, defang, detect_type, extract_iocs, refang
 from ioc_hunter.core.types import IOCType
 from ioc_hunter.correlator import correlate as _correlate
 from ioc_hunter.decoder import OPERATIONS as _DECODE_OPS
@@ -51,6 +52,11 @@ app = typer.Typer(
     rich_markup_mode="rich",
 )
 console = Console()
+
+def _safe(value: str) -> str:
+    """Defang + escape Rich markup so `[.]`, `[@]` etc render literally."""
+    return _escape_markup(defang(value))
+
 
 _VERDICT_STYLES: dict[Verdict, tuple[str, str]] = {
     Verdict.MALICIOUS: ("MALICIOUS", "bold red"),
@@ -92,7 +98,9 @@ def _open_cache(settings: Settings, enabled: bool) -> TICache | None:
 
 
 def _parse_ioc(value: str, type_hint: str | None) -> IOC | None:
-    value = value.strip()
+    # Refang first so defanged input like `1[.]2[.]3[.]4` or `hxxps://...`
+    # works through `check` the same way it does through `scan-file`.
+    value = refang(value.strip())
     if not value:
         return None
     if type_hint:
@@ -110,7 +118,7 @@ def _parse_ioc(value: str, type_hint: str | None) -> IOC | None:
 def _render_verdict_panel(verdict: IOCVerdict) -> None:
     label, style = _VERDICT_STYLES[verdict.verdict]
     body = (
-        f"[bold cyan]{defang(verdict.ioc.value)}[/]\n"
+        f"[bold cyan]{_safe(verdict.ioc.value)}[/]\n"
         f"[dim]type:[/] {verdict.ioc.type.value}\n\n"
         f"[{style}]{label}[/]  "
         f"[dim]confidence[/] {verdict.confidence:.0%}"
@@ -164,7 +172,7 @@ def _render_batch_table(verdicts: list[IOCVerdict]) -> None:
         non_err = sum(1 for r in v.results if r.error is None)
         total = len(v.results)
         table.add_row(
-            defang(v.ioc.value)[:60],
+            _safe(v.ioc.value)[:60],
             v.ioc.type.value,
             f"[{style}]{label}[/]",
             f"{v.confidence:.0%}",
@@ -190,7 +198,7 @@ async def _run_check(value: str, type_hint: str | None, use_cache: bool) -> int:
             if not active:
                 console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
                 return 2
-            with console.status(f"Querying {len(active)} source(s) for {defang(ioc.value)}..."):
+            with console.status(f"Querying {len(active)} source(s) for {_safe(ioc.value)}..."):
                 verdict = await engine.lookup_one(ioc)
     finally:
         if cache is not None:
@@ -346,9 +354,9 @@ async def _run_correlate(path: Path, use_cache: bool) -> int:
     for edge in edges:
         table.add_row(
             edge.kind,
-            defang(edge.source.value),
+            _safe(edge.source.value),
             "→",
-            defang(edge.target.value),
+            _safe(edge.target.value),
             edge.evidence,
         )
     console.print(table)
