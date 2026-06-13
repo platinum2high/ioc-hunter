@@ -24,6 +24,7 @@ from ioc_hunter.cache import TICache
 from ioc_hunter.config import Settings
 from ioc_hunter.core import IOC, defang, detect_type, extract_iocs
 from ioc_hunter.core.types import IOCType
+from ioc_hunter.correlator import correlate as _correlate
 from ioc_hunter.engine import Engine
 from ioc_hunter.exporters import to_json, to_markdown, to_misp, to_stix
 from ioc_hunter.scorer import IOCVerdict
@@ -300,6 +301,62 @@ def report(
     no_cache: bool = typer.Option(False, "--no-cache", help="Skip the SQLite cache."),
 ) -> None:
     exit_code = asyncio.run(_run_report(path, fmt, out, use_cache=not no_cache))
+    raise typer.Exit(exit_code)
+
+
+async def _run_correlate(path: Path, use_cache: bool) -> int:
+    iocs = extract_iocs(path.read_text(errors="replace"))
+    if not iocs:
+        console.print(f"[yellow]No IOCs found in[/] {path}")
+        return 0
+    console.print(f"Extracted [bold]{len(iocs)}[/] IOC(s) from {path}")
+
+    settings = Settings.from_env()
+    cache = _open_cache(settings, use_cache)
+    try:
+        async with httpx.AsyncClient() as client:
+            engine = _build_engine(client, settings, cache)
+            if not engine.active_sources:
+                console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
+                return 2
+            with console.status(f"Enriching {len(iocs)} IOC(s) for correlation..."):
+                verdicts = await engine.lookup_many(iocs)
+    finally:
+        if cache is not None:
+            cache.close()
+
+    edges = _correlate(verdicts)
+    if not edges:
+        console.print("[dim]No correlations found between the supplied IOCs.[/]")
+        return 0
+
+    table = Table(title=f"Correlations ({len(edges)})", box=SIMPLE)
+    table.add_column("Kind", style="cyan")
+    table.add_column("Source", overflow="fold")
+    table.add_column("→", style="dim")
+    table.add_column("Target", overflow="fold")
+    table.add_column("Evidence", style="dim", overflow="fold")
+    for edge in edges:
+        table.add_row(
+            edge.kind,
+            defang(edge.source.value),
+            "→",
+            defang(edge.target.value),
+            edge.evidence,
+        )
+    console.print(table)
+    return 0
+
+
+@app.command(
+    name="correlate",
+    help="Find shared infrastructure / tag pivots across a batch of IOCs.",
+)
+def correlate(
+    path: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, resolve_path=True),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Skip the SQLite cache."),
+) -> None:
+    exit_code = asyncio.run(_run_correlate(path, use_cache=not no_cache))
     raise typer.Exit(exit_code)
 
 

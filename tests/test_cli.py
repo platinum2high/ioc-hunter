@@ -207,6 +207,24 @@ def test_report_bad_format(patch_engine, tmp_path: Path) -> None:
     assert "Unknown format" in result.stdout
 
 
+def test_correlate_command(patch_engine, tmp_path: Path) -> None:
+    sample = tmp_path / "in.txt"
+    sample.write_text("Beacon to 185[.]220[.]101[.]42 and 185[.]220[.]101[.]99")
+    ip1 = IOC(value="185.220.101.42", type=IOCType.IPV4)
+    ip2 = IOC(value="185.220.101.99", type=IOCType.IPV4)
+    patch_engine(
+        {
+            "185.220.101.42": _verdict(ip1, tags=("apt",)),
+            "185.220.101.99": _verdict(ip2, tags=("apt",)),
+        }
+    )
+    result = runner.invoke(cli.app, ["correlate", str(sample), "--no-cache"])
+    assert result.exit_code == 0
+    # Subnet pair should show up; tag pair should show up.
+    assert "shared_subnet" in result.stdout
+    assert "shared_tag" in result.stdout
+
+
 def test_configure_writes_env(tmp_path: Path) -> None:
     target = tmp_path / "fresh.env"
     # Provide answers for each prompt: abuse_ch, abuseipdb, otx, virustotal, shodan
