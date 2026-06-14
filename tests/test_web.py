@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from ioc_hunter.config import Settings
 from ioc_hunter.core.types import IOC
 from ioc_hunter.scorer import IOCVerdict
 from ioc_hunter.sources.base import SourceResult, Verdict
 from ioc_hunter.web.app import create_app
+from ioc_hunter.web.quota import DailyQuota
 from ioc_hunter.web.rate_limit import RateLimiter
 
 
@@ -57,6 +60,18 @@ async def app_with_fake_engine() -> AsyncIterator[FastAPI]:
     app = create_app()
     app.state.engine = _FakeEngine()
     app.state.limiter = RateLimiter(max_requests=10_000, window_seconds=60)
+    app.state.quota = DailyQuota(limit=10_000)
+    app.state.settings = Settings(
+        abuse_ch_auth_key=None,
+        abuseipdb_api_key=None,
+        otx_api_key=None,
+        virustotal_api_key=None,
+        shodan_api_key=None,
+        cache_ttl=3600,
+        cache_dir=Path("/tmp"),
+        log_level="INFO",
+        max_concurrency=4,
+    )
     yield app
 
 
@@ -260,3 +275,213 @@ def test_rate_limiter_evicts_when_full() -> None:
         rl.allow(f"id{i}")
     # We should still be at or below max_entries.
     assert len(rl._buckets) <= 3
+
+
+# -- DailyQuota -----------------------------------------------------------
+
+
+def test_daily_quota_consume_and_status() -> None:
+    q = DailyQuota(limit=3)
+    s0 = q.status("a")
+    assert s0.used == 0
+    assert s0.remaining == 3
+    assert not s0.exhausted
+
+    q.consume("a")
+    q.consume("a")
+    s2 = q.status("a")
+    assert s2.used == 2
+    assert s2.remaining == 1
+
+    q.consume("a")
+    s3 = q.status("a")
+    assert s3.used == 3
+    assert s3.exhausted
+
+    # Over-consume is a no-op — used stays at the limit.
+    q.consume("a")
+    s4 = q.status("a")
+    assert s4.used == 3
+
+
+def test_daily_quota_per_identifier() -> None:
+    q = DailyQuota(limit=1)
+    q.consume("a")
+    assert q.status("a").exhausted
+    assert not q.status("b").exhausted
+
+
+# -- /api/quota -----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_quota_endpoint_starts_at_zero(client: httpx.AsyncClient) -> None:
+    resp = await client.get("/api/quota")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["used"] == 0
+    assert data["limit"] >= 1
+    assert data["remaining"] == data["limit"]
+
+
+@pytest.mark.asyncio
+async def test_check_decrements_quota(app_with_fake_engine: FastAPI) -> None:
+    app_with_fake_engine.state.quota = DailyQuota(limit=5)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_with_fake_engine), base_url="http://t"
+    ) as c:
+        resp = await c.post("/api/check", json={"value": "1.2.3.4"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["byok"] is False
+        assert data["quota"]["used"] == 1
+        assert data["quota"]["remaining"] == 4
+
+
+@pytest.mark.asyncio
+async def test_quota_exhausted_returns_402(app_with_fake_engine: FastAPI) -> None:
+    app_with_fake_engine.state.quota = DailyQuota(limit=2)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_with_fake_engine), base_url="http://t"
+    ) as c:
+        for _ in range(2):
+            r = await c.post("/api/check", json={"value": "1.2.3.4"})
+            assert r.status_code == 200
+        r = await c.post("/api/check", json={"value": "1.2.3.4"})
+        assert r.status_code == 402
+        body = r.json()
+        assert body["byok_supported"] is True
+        assert body["quota"]["remaining"] == 0
+        assert "demo quota" in body["detail"].lower()
+
+
+# -- BYOK -----------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def mocked_ti_endpoints():
+    """Mock every TI endpoint a BYOK lookup might hit, so tests run
+    without real network calls."""
+    import respx
+
+    with respx.mock(assert_all_called=False) as router:
+        router.route(host="check.torproject.org").mock(return_value=httpx.Response(200, text=""))
+        router.route(host="urlhaus-api.abuse.ch").mock(
+            return_value=httpx.Response(200, json={"query_status": "no_results"})
+        )
+        router.route(host="threatfox-api.abuse.ch").mock(
+            return_value=httpx.Response(200, json={"query_status": "no_result"})
+        )
+        router.route(host="api.abuseipdb.com").mock(
+            return_value=httpx.Response(200, json={"data": {"abuseConfidenceScore": 0}})
+        )
+        router.route(host="otx.alienvault.com").mock(return_value=httpx.Response(200, json={}))
+        router.route(host="www.virustotal.com").mock(
+            return_value=httpx.Response(200, json={"data": {"attributes": {}}})
+        )
+        yield router
+
+
+@pytest.mark.asyncio
+async def test_byok_bypasses_quota(app_with_fake_engine: FastAPI, mocked_ti_endpoints) -> None:
+    """A request with TI keys should not increment the quota counter."""
+    app_with_fake_engine.state.quota = DailyQuota(limit=2)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_with_fake_engine), base_url="http://t"
+    ) as c:
+        # Burn both quota units.
+        for _ in range(2):
+            await c.post("/api/check", json={"value": "1.2.3.4"})
+        # Server-key path is now exhausted.
+        r = await c.post("/api/check", json={"value": "1.2.3.4"})
+        assert r.status_code == 402
+
+        # BYOK request should still go through.
+        r = await c.post(
+            "/api/check",
+            json={
+                "value": "1.2.3.4",
+                "keys": {"virustotal_api_key": "vtfakekey"},
+            },
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["byok"] is True
+        # Used count is unchanged.
+        assert body["quota"]["used"] == 2
+
+
+@pytest.mark.asyncio
+async def test_byok_keys_are_validated(app_with_fake_engine: FastAPI, mocked_ti_endpoints) -> None:
+    """Empty or oversized keys are dropped, falling back to server keys."""
+    app_with_fake_engine.state.quota = DailyQuota(limit=5)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_with_fake_engine), base_url="http://t"
+    ) as c:
+        # All keys empty → still server-key path (byok=False, quota burned).
+        r = await c.post(
+            "/api/check",
+            json={
+                "value": "1.2.3.4",
+                "keys": {"virustotal_api_key": "  ", "otx_api_key": ""},
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["byok"] is False
+        assert r.json()["quota"]["used"] == 1
+
+        # Oversized key → dropped.
+        r = await c.post(
+            "/api/check",
+            json={
+                "value": "1.2.3.4",
+                "keys": {"virustotal_api_key": "x" * 5000},
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["byok"] is False
+
+
+@pytest.mark.asyncio
+async def test_byok_scan_path(app_with_fake_engine: FastAPI, mocked_ti_endpoints) -> None:
+    app_with_fake_engine.state.quota = DailyQuota(limit=1)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_with_fake_engine), base_url="http://t"
+    ) as c:
+        await c.post("/api/check", json={"value": "1.2.3.4"})  # burn the 1
+        r = await c.post(
+            "/api/scan",
+            json={
+                "text": "found 1.2.3.4 talking to evil.example",
+                "keys": {"otx_api_key": "otx-fake-token"},
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["byok"] is True
+
+
+@pytest.mark.asyncio
+async def test_byok_keys_not_echoed_in_response(
+    app_with_fake_engine: FastAPI, mocked_ti_endpoints
+) -> None:
+    app_with_fake_engine.state.quota = DailyQuota(limit=5)
+    secret = "supersecret-vt-token-do-not-leak"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_with_fake_engine), base_url="http://t"
+    ) as c:
+        r = await c.post(
+            "/api/check",
+            json={"value": "1.2.3.4", "keys": {"virustotal_api_key": secret}},
+        )
+        assert r.status_code == 200
+        assert secret not in r.text
+
+
+@pytest.mark.asyncio
+async def test_empty_text_response_includes_quota(client: httpx.AsyncClient) -> None:
+    """Empty-scan response should still expose the current quota."""
+    resp = await client.post("/api/scan", json={"text": "no indicators here"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "quota" in data
+    assert data["verdicts"] == []

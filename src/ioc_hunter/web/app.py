@@ -42,6 +42,7 @@ from ioc_hunter.sources import (
     URLhausSource,
     VirusTotalSource,
 )
+from ioc_hunter.web.quota import DailyQuota, QuotaStatus
 from ioc_hunter.web.rate_limit import RateLimiter
 
 # Hard limits — picked to keep one demo request well below free-dyno
@@ -50,11 +51,23 @@ _MAX_BODY_BYTES = 64 * 1024
 _MAX_TEXT_LEN = 32 * 1024
 _MAX_IOC_VALUE_LEN = 2048
 _MAX_IOCS_PER_SCAN = 25
+_MAX_API_KEY_LEN = 256
 
 # Rate limit defaults — overridable via env so we can tighten in prod
 # without a code change.
 _DEFAULT_RPM = int(os.getenv("IOC_WEB_RATE_LIMIT", "10"))
 _DEFAULT_WINDOW = float(os.getenv("IOC_WEB_RATE_WINDOW", "60"))
+_DEFAULT_DAILY_QUOTA = int(os.getenv("IOC_WEB_DAILY_QUOTA", "20"))
+_BYOK_TIMEOUT = float(os.getenv("IOC_BYOK_TIMEOUT", "12"))
+
+# Keys the client can send in BYOK mode. Maps the JSON field name to
+# the Settings dataclass attribute name we override.
+_BYOK_FIELDS: dict[str, str] = {
+    "abuse_ch_auth_key": "abuse_ch_auth_key",
+    "abuseipdb_api_key": "abuseipdb_api_key",
+    "otx_api_key": "otx_api_key",
+    "virustotal_api_key": "virustotal_api_key",
+}
 
 
 def _build_sources(client: httpx.AsyncClient, settings: Settings) -> list[Source]:
@@ -97,6 +110,96 @@ def _serialize_verdict(v: IOCVerdict) -> dict[str, Any]:
     }
 
 
+def _extract_byok_keys(payload: dict[str, Any]) -> dict[str, str]:
+    """Pull user-supplied TI keys out of a request payload, with validation.
+
+    Returns a dict mapping `_BYOK_FIELDS` field names to non-empty
+    string values. Anything missing or empty is dropped. Each key is
+    length-capped so a malicious client can't smuggle a huge string
+    through the body cap by stuffing it into a key field.
+    """
+    raw = payload.get("keys")
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    out: dict[str, str] = {}
+    for field in _BYOK_FIELDS:
+        value = raw.get(field)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped and len(stripped) <= _MAX_API_KEY_LEN:
+                out[field] = stripped
+    return out
+
+
+def _quota_response(stat: QuotaStatus) -> dict[str, Any]:
+    return {
+        "used": stat.used,
+        "limit": stat.limit,
+        "remaining": stat.remaining,
+        "reset_at": stat.reset_at,
+    }
+
+
+def _quota_exhausted_response(stat: QuotaStatus) -> JSONResponse:
+    return JSONResponse(
+        {
+            "detail": (
+                "daily demo quota exhausted — add your own API keys to keep "
+                "scanning, or come back tomorrow"
+            ),
+            "byok_supported": True,
+            "quota": _quota_response(stat),
+        },
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+    )
+
+
+def _build_byok_settings(base: Settings, byok: dict[str, str]) -> Settings:
+    """Return a Settings copy with TI keys replaced by user-supplied values.
+
+    Anything the user didn't supply becomes None — that source then
+    short-circuits to "missing key" the same way the CLI does in
+    keyless mode.
+    """
+    return Settings(
+        abuse_ch_auth_key=byok.get("abuse_ch_auth_key"),
+        abuseipdb_api_key=byok.get("abuseipdb_api_key"),
+        otx_api_key=byok.get("otx_api_key"),
+        virustotal_api_key=byok.get("virustotal_api_key"),
+        shodan_api_key=None,
+        cache_ttl=base.cache_ttl,
+        cache_dir=base.cache_dir,
+        log_level=base.log_level,
+        max_concurrency=base.max_concurrency,
+    )
+
+
+async def _run_byok_lookup(
+    request: Request,
+    iocs: list[IOC],
+    byok: dict[str, str],
+) -> list[IOCVerdict]:
+    """Run an isolated TI lookup using user-supplied keys.
+
+    We spin up a fresh httpx client + Engine for the request, route the
+    lookups through it, and tear it down before returning. The shared
+    SQLite cache is bypassed so BYOK results never mix with the
+    server-key cache (which would let one user infer another's
+    yesterday's lookups).
+    """
+    base: Settings = request.app.state.settings
+    temp_settings = _build_byok_settings(base, byok)
+    async with httpx.AsyncClient(timeout=_BYOK_TIMEOUT) as temp_client:
+        temp_engine = Engine(
+            _build_sources(temp_client, temp_settings),
+            cache=None,
+            max_concurrency=temp_settings.max_concurrency,
+        )
+        if len(iocs) == 1:
+            return [await temp_engine.lookup_one(iocs[0])]
+        return await temp_engine.lookup_many(iocs)
+
+
 def _client_ip(request: Request) -> str:
     """Best-effort client IP for rate-limit bucketing.
 
@@ -121,6 +224,7 @@ def create_app() -> FastAPI:
         max_requests=_DEFAULT_RPM,
         window_seconds=_DEFAULT_WINDOW,
     )
+    quota = DailyQuota(limit=_DEFAULT_DAILY_QUOTA)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -145,6 +249,7 @@ def create_app() -> FastAPI:
         app.state.cache = cache
         app.state.settings = settings
         app.state.limiter = limiter
+        app.state.quota = quota
         try:
             yield
         finally:
@@ -216,9 +321,14 @@ def create_app() -> FastAPI:
             ],
         }
 
+    @app.get("/api/quota")
+    async def quota_status(request: Request) -> dict[str, Any]:
+        q: DailyQuota = request.app.state.quota
+        ip = _client_ip(request)
+        return _quota_response(q.status(ip))
+
     @app.post("/api/check")
-    async def check(request: Request) -> dict[str, Any]:
-        engine: Engine = request.app.state.engine
+    async def check(request: Request) -> Any:
         payload = await _read_json(request)
         raw_value = payload.get("value")
         type_hint = payload.get("type")
@@ -245,12 +355,32 @@ def create_app() -> FastAPI:
             ioc_type = detected
 
         ioc = IOC(value=value, type=ioc_type)
+        byok = _extract_byok_keys(payload)
+
+        if byok:
+            verdicts = await _run_byok_lookup(request, [ioc], byok)
+            return {
+                "verdict": _serialize_verdict(verdicts[0]),
+                "byok": True,
+                "quota": _quota_response(request.app.state.quota.status(_client_ip(request))),
+            }
+
+        ip = _client_ip(request)
+        q: DailyQuota = request.app.state.quota
+        pre = q.status(ip)
+        if pre.exhausted:
+            return _quota_exhausted_response(pre)
+        post = q.consume(ip, cost=1)
+        engine: Engine = request.app.state.engine
         verdict = await engine.lookup_one(ioc)
-        return {"verdict": _serialize_verdict(verdict)}
+        return {
+            "verdict": _serialize_verdict(verdict),
+            "byok": False,
+            "quota": _quota_response(post),
+        }
 
     @app.post("/api/scan")
-    async def scan(request: Request) -> dict[str, Any]:
-        engine: Engine = request.app.state.engine
+    async def scan(request: Request) -> Any:
         payload = await _read_json(request)
         text = payload.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -260,15 +390,41 @@ def create_app() -> FastAPI:
 
         iocs = extract_iocs(text)
         if not iocs:
-            return {"iocs": [], "verdicts": []}
+            return {
+                "iocs_extracted": 0,
+                "cap": _MAX_IOCS_PER_SCAN,
+                "verdicts": [],
+                "byok": False,
+                "quota": _quota_response(request.app.state.quota.status(_client_ip(request))),
+            }
         if len(iocs) > _MAX_IOCS_PER_SCAN:
             iocs = iocs[:_MAX_IOCS_PER_SCAN]
 
+        byok = _extract_byok_keys(payload)
+        if byok:
+            verdicts = await _run_byok_lookup(request, iocs, byok)
+            return {
+                "iocs_extracted": len(iocs),
+                "cap": _MAX_IOCS_PER_SCAN,
+                "byok": True,
+                "verdicts": [_serialize_verdict(v) for v in verdicts],
+                "quota": _quota_response(request.app.state.quota.status(_client_ip(request))),
+            }
+
+        ip = _client_ip(request)
+        q: DailyQuota = request.app.state.quota
+        pre = q.status(ip)
+        if pre.exhausted:
+            return _quota_exhausted_response(pre)
+        post = q.consume(ip, cost=1)
+        engine: Engine = request.app.state.engine
         verdicts = await engine.lookup_many(iocs)
         return {
             "iocs_extracted": len(iocs),
             "cap": _MAX_IOCS_PER_SCAN,
+            "byok": False,
             "verdicts": [_serialize_verdict(v) for v in verdicts],
+            "quota": _quota_response(post),
         }
 
     # Static front. Mount last so /api/* routes win.
