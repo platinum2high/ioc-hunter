@@ -3,6 +3,8 @@
 Commands:
     ioc-hunter check <ioc>            single-IOC lookup
     ioc-hunter scan-file <path>       extract + enrich every IOC in a file
+    ioc-hunter parse-eml <path>       parse phishing .eml — headers, body, attachments
+    ioc-hunter watch <path>           tail a log file and alert on suspicious IOCs
     ioc-hunter correlate <path>       find pivots across a batch of IOCs
     ioc-hunter report <path>          render JSON / Markdown / STIX / MISP / Sigma / Suricata
     ioc-hunter decode <text>          base64 / hex / URL / JWT / gzip / ... (magic by default)
@@ -26,7 +28,8 @@ from rich.table import Table
 from ioc_hunter import __version__
 from ioc_hunter.cache import TICache
 from ioc_hunter.config import Settings
-from ioc_hunter.core import IOC, defang, detect_type, extract_iocs, refang
+from ioc_hunter.core import IOC, defang, detect_type, extract_iocs, parse_eml, refang
+from ioc_hunter.core.eml import EmailReport
 from ioc_hunter.core.types import IOCType
 from ioc_hunter.correlator import correlate as _correlate
 from ioc_hunter.decoder import OPERATIONS as _DECODE_OPS
@@ -39,6 +42,7 @@ from ioc_hunter.rules import to_sigma, to_suricata
 from ioc_hunter.scorer import IOCVerdict
 from ioc_hunter.sources import (
     AbuseIPDBSource,
+    NetMetaSource,
     OTXSource,
     Source,
     ThreatFoxSource,
@@ -47,6 +51,8 @@ from ioc_hunter.sources import (
     Verdict,
     VirusTotalSource,
 )
+from ioc_hunter.watcher import WatchAlert, resolve_threshold
+from ioc_hunter.watcher import watch as _watch
 
 app = typer.Typer(
     name="ioc-hunter",
@@ -74,6 +80,7 @@ def _build_sources(client: httpx.AsyncClient, settings: Settings) -> list[Source
     """Instantiate every source. Sources without a key stay registered but
     will short-circuit to UNKNOWN with an error explaining why."""
     return [
+        NetMetaSource(client),
         TorExitSource(client),
         URLhausSource(client, api_key=settings.abuse_ch_auth_key),
         ThreatFoxSource(client, api_key=settings.abuse_ch_auth_key),
@@ -259,6 +266,211 @@ def scan_file(
     no_cache: bool = typer.Option(False, "--no-cache", help="Skip the SQLite cache."),
 ) -> None:
     exit_code = asyncio.run(_run_scan_file(path, use_cache=not no_cache))
+    raise typer.Exit(exit_code)
+
+
+def _render_eml_summary(report: EmailReport) -> None:
+    """Header / envelope summary for a parsed .eml."""
+    lines = []
+    if report.subject:
+        lines.append(f"[bold cyan]Subject:[/] {_safe(report.subject)}")
+    if report.from_addr:
+        lines.append(f"[dim]From:[/]    {_safe(report.from_addr)}")
+    if report.reply_to and report.reply_to != report.from_addr:
+        lines.append(f"[yellow]Reply-To:[/] {_safe(report.reply_to)}  [dim](differs from From!)[/]")
+    if report.return_path and report.return_path != report.from_addr:
+        lines.append(f"[yellow]Return-Path:[/] {_safe(report.return_path)}")
+    if report.to_addrs:
+        joined = ", ".join(_safe(a) for a in report.to_addrs[:5])
+        if len(report.to_addrs) > 5:
+            joined += f", [dim]... +{len(report.to_addrs) - 5} more[/]"
+        lines.append(f"[dim]To:[/]      {joined}")
+    if report.date:
+        lines.append(f"[dim]Date:[/]    {_safe(report.date)}")
+    if report.message_id:
+        lines.append(f"[dim]Msg-ID:[/]  {_safe(report.message_id)}")
+    if report.x_originating_ip:
+        lines.append(f"[bold magenta]X-Originating-IP:[/] {_safe(report.x_originating_ip)}")
+    console.print(Panel.fit("\n".join(lines), title="Envelope", border_style="cyan"))
+
+
+def _render_eml_received_chain(report: EmailReport) -> None:
+    if not report.received_chain:
+        return
+    table = Table(title="Received chain (oldest last)", box=SIMPLE, show_lines=False)
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Hop", overflow="fold")
+    for idx, hop in enumerate(report.received_chain, start=1):
+        preview = hop if len(hop) <= 120 else hop[:117] + "..."
+        table.add_row(str(idx), _safe(preview))
+    console.print(table)
+
+
+def _render_eml_attachments(report: EmailReport) -> None:
+    if not report.attachments:
+        return
+    table = Table(title=f"Attachments ({len(report.attachments)})", box=SIMPLE)
+    table.add_column("Name", style="cyan", overflow="fold")
+    table.add_column("Type", style="dim")
+    table.add_column("Size", justify="right")
+    table.add_column("SHA-256", style="dim", overflow="fold")
+    for att in report.attachments:
+        table.add_row(
+            _safe(att.filename),
+            att.content_type,
+            f"{att.size:,}",
+            att.sha256,
+        )
+    console.print(table)
+
+
+async def _run_parse_eml(path: Path, enrich: bool, use_cache: bool) -> int:
+    report = parse_eml(path)
+    _render_eml_summary(report)
+    _render_eml_received_chain(report)
+    _render_eml_attachments(report)
+
+    if not report.iocs:
+        console.print("[yellow]No IOCs extracted from this message.[/]")
+        return 0
+    console.print(f"\nExtracted [bold]{len(report.iocs)}[/] IOC(s) from .eml")
+
+    if not enrich:
+        # Show IOCs in a compact table without TI enrichment.
+        table = Table(title="IOCs", box=SIMPLE)
+        table.add_column("IOC", style="cyan", overflow="fold")
+        table.add_column("Type", style="dim")
+        for ioc in report.iocs:
+            table.add_row(_safe(ioc.value), ioc.type.value)
+        console.print(table)
+        return 0
+
+    settings = Settings.from_env()
+    cache = _open_cache(settings, use_cache)
+    try:
+        async with httpx.AsyncClient() as client:
+            engine = _build_engine(client, settings, cache)
+            active = engine.active_sources
+            if not active:
+                console.print("[yellow]No active TI sources — run `ioc-hunter configure`.[/]")
+                console.print("[dim]Re-run with --no-enrich to see IOCs without TI lookups.[/]")
+                return 2
+            with console.status(
+                f"Enriching {len(report.iocs)} IOC(s) across {len(active)} source(s)..."
+            ):
+                verdicts = await engine.lookup_many(list(report.iocs))
+    finally:
+        if cache is not None:
+            cache.close()
+
+    _render_batch_table(verdicts)
+    return 0
+
+
+@app.command(
+    name="parse-eml",
+    help="Parse a phishing .eml — headers, body, attachments — and enrich its IOCs.",
+)
+def parse_eml_cmd(
+    path: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, resolve_path=True),
+    no_enrich: bool = typer.Option(
+        False, "--no-enrich", help="Show IOCs without TI lookups (offline mode)."
+    ),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Skip the SQLite cache."),
+) -> None:
+    exit_code = asyncio.run(_run_parse_eml(path, enrich=not no_enrich, use_cache=not no_cache))
+    raise typer.Exit(exit_code)
+
+
+def _render_alert(alert: WatchAlert) -> None:
+    label, style = _VERDICT_STYLES[alert.verdict.verdict]
+    ioc = alert.verdict.ioc
+    body = (
+        f"[bold]IOC:[/] [cyan]{_safe(ioc.value)}[/] [dim]({ioc.type.value})[/]\n"
+        f"[{style}]{label}[/]  [dim]confidence[/] {alert.verdict.confidence:.0%}\n"
+    )
+    if alert.verdict.tags:
+        body += f"[yellow]tags:[/] {', '.join(alert.verdict.tags[:6])}\n"
+    line_preview = alert.source_line
+    if len(line_preview) > 140:
+        line_preview = line_preview[:137] + "..."
+    body += f"[dim]line:[/] {_safe(line_preview)}"
+    console.print(Panel.fit(body, title="ALERT", border_style=style))
+
+
+async def _run_watch(
+    path: Path,
+    threshold_name: str,
+    from_start: bool,
+    debounce: float,
+    use_cache: bool,
+) -> int:
+    try:
+        threshold = resolve_threshold(threshold_name)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        return 2
+
+    settings = Settings.from_env()
+    cache = _open_cache(settings, use_cache)
+    console.print(
+        Panel.fit(
+            f"[bold]Watching[/] {path}\n"
+            f"[dim]threshold:[/] {threshold.value}  "
+            f"[dim]debounce:[/] {debounce}s  "
+            f"[dim]from-start:[/] {from_start}\n"
+            f"[dim]Press Ctrl-C to stop.[/]",
+            border_style="cyan",
+        )
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            engine = _build_engine(client, settings, cache)
+            if not engine.active_sources:
+                console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
+                return 2
+            try:
+                async for alert in _watch(
+                    path,
+                    engine,
+                    threshold=threshold,
+                    debounce_seconds=debounce,
+                    from_start=from_start,
+                ):
+                    _render_alert(alert)
+            except KeyboardInterrupt:
+                console.print("\n[dim]Stopped.[/]")
+    finally:
+        if cache is not None:
+            cache.close()
+    return 0
+
+
+@app.command(
+    name="watch",
+    help="Tail a log file and alert on IOCs whose verdict meets a threshold.",
+)
+def watch_cmd(
+    path: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, resolve_path=True),
+    threshold: str = typer.Option(
+        "suspicious",
+        "--threshold",
+        "-t",
+        help="Alert on this verdict or worse: malicious | suspicious | benign | unknown.",
+    ),
+    from_start: bool = typer.Option(
+        False,
+        "--from-start",
+        help="Scan from the start of the file (default: tail only new lines).",
+    ),
+    debounce: float = typer.Option(
+        2.0, "--debounce", help="Seconds of quiet before flushing a batch."
+    ),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Skip the SQLite cache."),
+) -> None:
+    exit_code = asyncio.run(
+        _run_watch(path, threshold, from_start, debounce, use_cache=not no_cache)
+    )
     raise typer.Exit(exit_code)
 
 

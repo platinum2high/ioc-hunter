@@ -1,22 +1,26 @@
 # IOC Hunter
 
 > Async threat intelligence correlation engine for SOC analysts.
-> Paste in a phishing report, get back verdicts from six TI feeds,
-> a correlation graph, and ready-to-deploy Sigma / Suricata / STIX / MISP.
+> Paste in a phishing report or .eml, tail a live log, get back verdicts
+> from seven TI feeds, a correlation graph, and ready-to-deploy Sigma /
+> Suricata / STIX / MISP.
 
 [![CI](https://github.com/platinum2high/ioc-hunter/actions/workflows/ci.yml/badge.svg)](https://github.com/platinum2high/ioc-hunter/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-217%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-244%20passing-brightgreen)
 
 ---
 
 ## ⚡ Works keyless out of the box
 
-You don't need any API keys to try it. Clone, install, run — the
-**Tor exit** source works immediately with no signup, so you can demo
-the whole pipeline (parsing, defang, scoring, output, correlation,
-exporters, decoder) without registering for anything.
+You don't need any API keys to try it. Clone, install, run — **two
+sources work immediately** with no signup:
+
+- **Tor exit** — flags traffic from Tor relays
+- **NetMeta** — offline classifier for bogon / private / CGNAT / reserved
+  IP ranges (RFC 1918, RFC 5737, RFC 6598, RFC 6890). A `test-net` or
+  `240/4` IP in a production log = misconfig or spoofed traffic.
 
 ```bash
 git clone https://github.com/platinum2high/ioc-hunter
@@ -38,9 +42,11 @@ message — they don't crash, just gracefully skip.
 
 | Capability | Most IOC checkers | IOC Hunter |
 | --- | --- | --- |
-| Input | one IOC at a time | drag in a whole report |
+| Input | one IOC at a time | drag in a whole report, paste `.eml`, or tail a live log |
 | Defang-aware | usually no | `evil[.]com`, `hxxp://`, `[at]` all understood |
-| Sources | 1 (usually VT) | 6 in parallel: VT, AbuseIPDB, OTX, URLhaus, ThreatFox, Tor exit |
+| Sources | 1 (usually VT) | 7 in parallel: VT, AbuseIPDB, OTX, URLhaus, ThreatFox, Tor exit, NetMeta |
+| Phishing triage | none | `.eml` parser: From/Reply-To mismatch, Received chain, attachment hashes |
+| Live monitoring | none | `watch` mode — tail a log, alert on suspicious IOCs in real time |
 | Scoring | bad/good | transparent weighted model with per-source contribution |
 | Output | terminal text | JSON, Markdown, **STIX 2.1**, **MISP**, **Sigma**, **Suricata** |
 | Correlation | none | shared-subnet + shared-tag pivots across the batch |
@@ -121,6 +127,8 @@ mounted as a volume so it survives across containers.
 ```
 ioc-hunter check <ioc>                       single IOC verdict
 ioc-hunter scan-file <path>                  extract + enrich every IOC in a file
+ioc-hunter parse-eml <path>                  phishing .eml — headers, body, attachments
+ioc-hunter watch <path>                      tail a log file and alert on suspicious IOCs
 ioc-hunter correlate <path>                  shared-infra and shared-tag pivots
 ioc-hunter report <path> --format <fmt>      json | md | stix | misp | sigma | suricata
 ioc-hunter decode <text> [--op <name>]       base64 / hex / URL / JWT / gzip / ... (magic by default)
@@ -161,6 +169,35 @@ Note: every IOC is **defanged on output** so you can't accidentally
 click `evil.com` from your terminal. They were also defanged on input
 (`185[.]220[.]101[.]42`, `hxxps://`, `bad[at]evil[.]com`) — refanging
 is automatic.
+
+### Triage a phishing `.eml`
+
+```bash
+ioc-hunter parse-eml suspicious.eml
+```
+
+![ioc-hunter parse-eml](docs/screenshots/parse-eml.svg)
+
+The envelope panel flags **Reply-To ≠ From** and surfaces
+**X-Originating-IP** explicitly — both classic phishing tells.
+The Received chain reveals the real MTA hops. Attachments are
+hashed (SHA-256 + MD5) and their hashes flow straight into the TI
+lookups along with body URLs, header IPs, and quoted domains.
+
+Add `--no-enrich` for an offline-only parse (no TI calls).
+
+### Watch a log file live
+
+```bash
+ioc-hunter watch /var/log/auth.log --threshold suspicious
+```
+
+![ioc-hunter watch](docs/screenshots/watch.svg)
+
+Tail-style polling with log-rotation handling (inode change or truncate
+re-opens from the start). Bursts are debounced — a thousand-line spike
+becomes one batched TI lookup, not a thousand. Alerts only fire for
+verdicts at or above the configured threshold.
 
 ### Find cross-IOC pivots
 
@@ -278,6 +315,7 @@ Force a specific op: `--op base64`, `--op hex`, `--op url`, `--op jwt`,
 | AlienVault OTX | API key (free) | IPv4, IPv6, domain, URL, file, CVE | 0.75 |
 | VirusTotal | API key (free 4/min) | IPv4, IPv6, domain, URL, file | 0.90 |
 | Tor exit list | **none** | IPv4, IPv6 | 0.40 |
+| NetMeta (offline) | **none** | IPv4, IPv6 | 0.20 |
 
 Adding a source is one file: subclass `Source`, implement `async lookup()`,
 import in `sources/__init__.py`. See `sources/tor_exit.py` for the
@@ -303,8 +341,9 @@ All planned phases done.
 | 9 — Sigma / Suricata rule generation | ✅ |
 | 10 — CyberChef-style decoder | ✅ |
 | 11 — Docker, CI, README | ✅ |
+| 12 — .eml parser, watch-mode, NetMeta source | ✅ |
 
-**217 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
+**244 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
 Docker build, `ruff` lint + format check, and `gitleaks` secret scan on
 every push.
 
