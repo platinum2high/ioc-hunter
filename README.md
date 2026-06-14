@@ -8,7 +8,19 @@
 [![CI](https://github.com/platinum2high/ioc-hunter/actions/workflows/ci.yml/badge.svg)](https://github.com/platinum2high/ioc-hunter/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-244%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-263%20passing-brightgreen)
+
+---
+
+## 🌐 Try it in the browser — no install
+
+A paste-and-check web demo lives at the public Render deployment.
+Paste any text, get back verdicts in real time. No signup, no
+data retention, the rendered code is the same engine you run
+locally.
+
+**Deploy your own** in two clicks: see [`Self-host the web demo`](#self-host-the-web-demo)
+below.
 
 ---
 
@@ -256,6 +268,48 @@ Force a specific op: `--op base64`, `--op hex`, `--op url`, `--op jwt`,
 
 ---
 
+## Self-host the web demo
+
+The repo ships a FastAPI front (`src/ioc_hunter/web/`) and a Render
+`render.yaml` Blueprint. Free tier is fine for a portfolio demo —
+the dyno sleeps after 15 minutes of inactivity and wakes on the
+next request (~30 s cold start).
+
+### Run it locally
+
+```bash
+pip install -e ".[web]"
+uvicorn ioc_hunter.web:app --host 0.0.0.0 --port 8000
+# → http://localhost:8000
+```
+
+### Deploy to Render in 5 clicks
+
+1. Push this repo to your GitHub.
+2. <https://dashboard.render.com/> → **New +** → **Blueprint**.
+3. Pick the `ioc-hunter` repo. Render auto-discovers `render.yaml`.
+4. Click **Apply**. The Free service builds from `Dockerfile.web`.
+5. *(Optional)* In the service → **Environment**, set any TI API
+   keys you have (`ABUSE_CH_AUTH_KEY`, `ABUSEIPDB_API_KEY`,
+   `OTX_API_KEY`, `VIRUSTOTAL_API_KEY`). Without them, the
+   keyless sources (NetMeta + Tor exit) still work.
+
+Every push to `main` redeploys automatically. Health endpoint at
+`/healthz`, API docs at `/api/docs`.
+
+### Built-in safety
+
+- Hard rate limit (10 req/min per IP, configurable via env)
+- Body cap (64 KB), text cap (32 KB), max 25 IOCs per scan
+- No IOC retention — request data leaves no trace beyond the
+  in-process cache, keyed by source/type/value only
+- Security headers (`X-Content-Type-Options`, `X-Frame-Options`,
+  `Referrer-Policy`)
+- Trusts only the leftmost `X-Forwarded-For` value (Render's edge)
+  for rate-limit bucketing — defeats trivial header spoofing
+
+---
+
 ## Architecture
 
 ```
@@ -342,8 +396,9 @@ All planned phases done.
 | 10 — CyberChef-style decoder | ✅ |
 | 11 — Docker, CI, README | ✅ |
 | 12 — .eml parser, watch-mode, NetMeta source | ✅ |
+| 13 — FastAPI web demo + Render Blueprint | ✅ |
 
-**244 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
+**263 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
 Docker build, `ruff` lint + format check, and `gitleaks` secret scan on
 every push.
 

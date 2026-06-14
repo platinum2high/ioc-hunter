@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Paste a phishing report or any text — get back verdicts from seven threat-intel feeds. Free, no signup, no data retention." />
+  <title>IOC Hunter — paste-and-check threat intel</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="logo">▮</span>
+      <span class="title">IOC Hunter</span>
+      <span class="ver" id="version"></span>
+    </div>
+    <nav>
+      <a href="https://github.com/platinum2high/ioc-hunter" target="_blank" rel="noopener">GitHub</a>
+      <a href="/api/docs" target="_blank" rel="noopener">API</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="intro">
+      <h1>Paste a phishing report.<br />Get verdicts from <span id="active-count">7</span> threat-intel feeds.</h1>
+      <p class="sub">
+        No signup. No data retention. <a href="https://github.com/platinum2high/ioc-hunter" target="_blank" rel="noopener">Read the source</a>.
+      </p>
+    </section>
+
+    <section class="form">
+      <textarea id="input" placeholder="Paste an incident report, log snippet, .eml header, or a single IOC. Defanged (evil[.]com, hxxp://, [at]) is fine.&#10;&#10;Try:&#10;Suspicious traffic from 185[.]220[.]101[.]42 hitting hxxp://evil[.]example/login.php&#10;Attached payload SHA-256: 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"></textarea>
+      <div class="controls">
+        <button id="scan-btn" type="button">Scan</button>
+        <span class="hint">Up to 32 KB · max 25 IOCs · 10 requests/min</span>
+      </div>
+    </section>
+
+    <section id="status" class="status hidden" aria-live="polite"></section>
+    <section id="results" class="results"></section>
+
+    <section class="sources">
+      <h2>Active sources</h2>
+      <div id="sources-grid" class="sources-grid"></div>
+    </section>
+
+    <section class="features">
+      <h2>What this is</h2>
+      <ul>
+        <li><strong>Async TI engine.</strong> Seven feeds in parallel: Tor exit, NetMeta (bogon/private), URLhaus, ThreatFox, AbuseIPDB, OTX, VirusTotal.</li>
+        <li><strong>Transparent scoring.</strong> Weighted by source confidence — no black box.</li>
+        <li><strong>Defang-aware.</strong> Paste <code>evil[.]com</code>, <code>hxxp://</code>, <code>[at]</code> — refanged automatically.</li>
+        <li><strong>Same code as the CLI.</strong> This page is a thin layer over the open-source engine. <code>pip install ioc-hunter</code> for the full thing (parse-eml, watch-mode, STIX/MISP/Sigma export, correlator).</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <span>MIT · <a href="https://github.com/platinum2high/ioc-hunter" target="_blank" rel="noopener">github.com/platinum2high/ioc-hunter</a></span>
+  </footer>
+
+  <script src="/script.js"></script>
+</body>
+</html>

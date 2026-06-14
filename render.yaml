@@ -1,0 +1,45 @@
+# Render Blueprint — auto-discovered by Render when you connect this
+# repo via "New → Blueprint". One Free service running the web demo.
+#
+# After connecting:
+#   1. Render creates the service automatically from this file.
+#   2. Optional: in the dashboard, set the TI API keys as environment
+#      variables (ABUSE_CH_AUTH_KEY, ABUSEIPDB_API_KEY, OTX_API_KEY,
+#      VIRUSTOTAL_API_KEY). Without them the keyless sources (NetMeta
+#      and Tor exit) still work.
+#   3. Deploys trigger automatically on every push to `main`.
+
+services:
+  - type: web
+    name: ioc-hunter-demo
+    plan: free
+    region: oregon
+    runtime: docker
+    dockerfilePath: ./Dockerfile.web
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      # Tighter limits in prod than the local defaults. Override here if
+      # you want to loosen them once you have a feel for usage.
+      - key: IOC_WEB_RATE_LIMIT
+        value: "10"
+      - key: IOC_WEB_RATE_WINDOW
+        value: "60"
+      - key: IOC_MAX_CONCURRENCY
+        value: "4"
+      # Disk-free cache fallback — the free dyno is ephemeral, but the
+      # cache survives within one container's lifetime which still cuts
+      # API quota burn during a single user's session.
+      - key: IOC_CACHE_DIR
+        value: "/app/cache"
+      # TI keys are NOT in this file by design — set them in the Render
+      # dashboard so they stay out of git. Sources without keys
+      # gracefully degrade.
+      - key: ABUSE_CH_AUTH_KEY
+        sync: false
+      - key: ABUSEIPDB_API_KEY
+        sync: false
+      - key: OTX_API_KEY
+        sync: false
+      - key: VIRUSTOTAL_API_KEY
+        sync: false

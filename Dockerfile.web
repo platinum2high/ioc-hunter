@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# IOC Hunter — web demo image. Same engine as the CLI image, but boots
+# the FastAPI front via uvicorn instead of the typer CLI. Intended for
+# Render's free dyno or any container host.
+# =============================================================================
+
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+RUN pip install --no-cache-dir --upgrade pip build
+
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+
+# Build the wheel with web extras pinned in.
+RUN pip wheel --no-cache-dir --wheel-dir /wheels ".[web]"
+
+# -----------------------------------------------------------------------------
+
+FROM python:3.12-slim AS runtime
+
+LABEL org.opencontainers.image.title="ioc-hunter-web"
+LABEL org.opencontainers.image.description="Paste-and-check threat intel demo."
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.source="https://github.com/platinum2high/ioc-hunter"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    IOC_CACHE_DIR=/app/cache \
+    PORT=8000
+
+WORKDIR /app
+
+RUN groupadd --system ioc \
+    && useradd --system --gid ioc --home-dir /app --shell /sbin/nologin ioc \
+    && mkdir -p /app/cache \
+    && chown -R ioc:ioc /app
+
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/*.whl \
+    && rm -rf /wheels
+
+USER ioc
+EXPOSE 8000
+
+# Render injects $PORT — bind to that, fall back to 8000 for local docker run.
+CMD ["sh", "-c", "uvicorn ioc_hunter.web:app --host 0.0.0.0 --port ${PORT:-8000}"]
