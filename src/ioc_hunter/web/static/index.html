@@ -15,6 +15,7 @@
       <span class="ver" id="version"></span>
     </div>
     <nav>
+      <span id="quota-pill" class="quota-pill" title="Daily demo quota — refills at UTC midnight">…</span>
       <a href="https://github.com/platinum2high/ioc-hunter" target="_blank" rel="noopener">GitHub</a>
       <a href="/api/docs" target="_blank" rel="noopener">API</a>
     </nav>
@@ -37,6 +38,44 @@
     </section>
 
     <section id="status" class="status hidden" aria-live="polite"></section>
+
+    <details id="byok-panel" class="byok-panel">
+      <summary>
+        <span class="byok-title">Bring your own API keys</span>
+        <span class="byok-sub">Bypass the demo quota — keys live only in your browser.</span>
+      </summary>
+      <div class="byok-grid">
+        <label>
+          <span>abuse.ch Auth-Key  <a href="https://auth.abuse.ch/" target="_blank" rel="noopener">get</a></span>
+          <input type="password" id="key-abuse-ch" autocomplete="off" placeholder="urlhaus + threatfox" />
+        </label>
+        <label>
+          <span>AbuseIPDB  <a href="https://www.abuseipdb.com/register" target="_blank" rel="noopener">get</a></span>
+          <input type="password" id="key-abuseipdb" autocomplete="off" placeholder="ipv4/ipv6 reputation" />
+        </label>
+        <label>
+          <span>AlienVault OTX  <a href="https://otx.alienvault.com/" target="_blank" rel="noopener">get</a></span>
+          <input type="password" id="key-otx" autocomplete="off" placeholder="ip/domain/url/hash/cve" />
+        </label>
+        <label>
+          <span>VirusTotal  <a href="https://www.virustotal.com/" target="_blank" rel="noopener">get</a></span>
+          <input type="password" id="key-vt" autocomplete="off" placeholder="multi-engine reputation" />
+        </label>
+      </div>
+      <div class="byok-controls">
+        <label class="remember">
+          <input type="checkbox" id="byok-remember" />
+          <span>Remember in this browser (localStorage)</span>
+        </label>
+        <button type="button" id="byok-clear" class="ghost">Clear keys</button>
+      </div>
+      <p class="byok-note">
+        Keys are sent over HTTPS only with the request that needs them, never stored
+        on the server, never logged, never returned in responses. For full control,
+        <a href="https://github.com/platinum2high/ioc-hunter#self-host-the-web-demo" target="_blank" rel="noopener">self-host the demo</a>.
+      </p>
+    </details>
+
     <section id="results" class="results"></section>
 
     <section class="sources">
