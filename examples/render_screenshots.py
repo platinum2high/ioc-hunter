@@ -16,10 +16,12 @@ from rich.console import Console
 from rich.terminal_theme import MONOKAI
 
 from ioc_hunter import cli
+from ioc_hunter.core.eml import EmailAttachment, EmailReport
 from ioc_hunter.core.types import IOC, IOCType
 from ioc_hunter.correlator import Correlation
 from ioc_hunter.scorer import IOCVerdict
 from ioc_hunter.sources.base import SourceResult, Verdict
+from ioc_hunter.watcher import WatchAlert
 
 OUTPUT_DIR = Path(__file__).parent.parent / "docs" / "screenshots"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -182,6 +184,7 @@ def render_sources(console: Console) -> None:
     from rich.table import Table
 
     rows = [
+        ("netmeta", "active", 0.20, "ipv4, ipv6", "no"),
         ("tor_exit", "active", 0.40, "ipv4, ipv6", "no"),
         ("urlhaus", "active", 0.85, "domain, ipv4, md5, sha256, url", "yes"),
         ("threatfox", "active", 0.85, "domain, email, ipv4, ipv6, md5, sha1, sha256, url", "yes"),
@@ -215,10 +218,138 @@ def render_decode(console: Console) -> None:
     console.print(table)
 
 
+def _phishing_report() -> EmailReport:
+    return EmailReport(
+        subject="URGENT: Verify your account or it will be locked",
+        from_addr="Bank Support <support@b4nk-secure.com>",
+        reply_to="attacker@evil.example",
+        return_path="<bounce@evil.example>",
+        to_addrs=("victim@corp.example",),
+        message_id="<deadbeef@evil.example>",
+        date="Mon, 14 Jun 2026 12:00:00 +0000",
+        received_chain=(
+            "from mail.evil.example (mail.evil.example [185.220.101.5]) by mx.corp.example",
+            "from outbound.evil.example (outbound [203.0.113.7]) by mail.evil.example",
+        ),
+        x_originating_ip="185.220.101.5",
+        body_text="",
+        body_html="",
+        attachments=(
+            EmailAttachment(
+                filename="invoice.exe",
+                content_type="application/octet-stream",
+                size=46592,
+                sha256="275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
+                md5="44d88612fea8a8f36de82e1278abb02f",
+            ),
+        ),
+        iocs=(
+            IOC("185.220.101.5", IOCType.IPV4),
+            IOC("203.0.113.7", IOCType.IPV4),
+            IOC("attacker@evil.example", IOCType.EMAIL),
+            IOC("evil.example", IOCType.DOMAIN),
+            IOC("https://login.evil.example/verify", IOCType.URL),
+            IOC("275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f", IOCType.SHA256),
+            IOC("44d88612fea8a8f36de82e1278abb02f", IOCType.MD5),
+        ),
+    )
+
+
+def render_parse_eml(console: Console) -> None:
+    report = _phishing_report()
+    cli._render_eml_summary(report)
+    cli._render_eml_received_chain(report)
+    cli._render_eml_attachments(report)
+    console.print(f"\nExtracted [bold]{len(report.iocs)}[/] IOC(s) from .eml")
+    verdicts = [
+        IOCVerdict(
+            ioc=IOC("185.220.101.5", IOCType.IPV4),
+            verdict=Verdict.MALICIOUS,
+            confidence=0.62,
+            results=tuple(),
+            tags=("tor", "anonymizer", "Bruteforce"),
+        ),
+        IOCVerdict(
+            ioc=IOC("203.0.113.7", IOCType.IPV4),
+            verdict=Verdict.SUSPICIOUS,
+            confidence=0.30,
+            results=tuple(),
+            tags=("bogon", "test-net-3"),
+        ),
+        IOCVerdict(
+            ioc=IOC("evil.example", IOCType.DOMAIN),
+            verdict=Verdict.MALICIOUS,
+            confidence=0.55,
+            results=tuple(),
+            tags=("phishing", "malware"),
+        ),
+        IOCVerdict(
+            ioc=IOC("275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f", IOCType.SHA256),
+            verdict=Verdict.MALICIOUS,
+            confidence=0.48,
+            results=tuple(),
+            tags=("emotet", "windows"),
+        ),
+        IOCVerdict(
+            ioc=IOC("https://login.evil.example/verify", IOCType.URL),
+            verdict=Verdict.MALICIOUS,
+            confidence=0.51,
+            results=tuple(),
+            tags=("phishing",),
+        ),
+    ]
+    cli._render_batch_table(verdicts)
+
+
+def render_watch(console: Console) -> None:
+    from rich.panel import Panel
+
+    console.print(
+        Panel.fit(
+            "[bold]Watching[/] /var/log/auth.log\n"
+            "[dim]threshold:[/] suspicious  [dim]debounce:[/] 2.0s  [dim]from-start:[/] False\n"
+            "[dim]Press Ctrl-C to stop.[/]",
+            border_style="cyan",
+        )
+    )
+    alerts = [
+        WatchAlert(
+            verdict=IOCVerdict(
+                ioc=IOC("185.220.101.5", IOCType.IPV4),
+                verdict=Verdict.MALICIOUS,
+                confidence=0.62,
+                results=tuple(),
+                tags=("tor", "anonymizer", "Bruteforce", "SSH"),
+            ),
+            source_line=(
+                "Jun 14 14:03:21 web01 sshd[28471]: Failed password for root "
+                "from 185.220.101.5 port 51234 ssh2"
+            ),
+        ),
+        WatchAlert(
+            verdict=IOCVerdict(
+                ioc=IOC("evil.example", IOCType.DOMAIN),
+                verdict=Verdict.SUSPICIOUS,
+                confidence=0.40,
+                results=tuple(),
+                tags=("phishing",),
+            ),
+            source_line=(
+                'Jun 14 14:03:22 web01 nginx: 10.0.0.5 - - [14/Jun/2026:14:03:22] '
+                '"GET /api/track?to=evil.example HTTP/1.1" 200'
+            ),
+        ),
+    ]
+    for alert in alerts:
+        cli._render_alert(alert)
+
+
 if __name__ == "__main__":
     _record("check", render_check)
     _record("scan-file", render_scan)
     _record("correlate", render_correlate)
     _record("sources", render_sources)
     _record("decode", render_decode)
+    _record("parse-eml", render_parse_eml)
+    _record("watch", render_watch)
     print(f"\nDone — {OUTPUT_DIR}")
