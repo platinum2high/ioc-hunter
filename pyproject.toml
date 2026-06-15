@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ioc-hunter"
-version = "0.1.0"
+version = "0.2.0"
 description = "Async threat intelligence correlation engine for SOC analysts. Auto-parses IOCs from raw text, queries multiple TI sources in parallel, scores them with a transparent weighted model, exports to STIX/MISP, and generates Sigma/Suricata detection rules."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -85,6 +85,7 @@ ignore = ["E501"] # line length handled by formatter
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"] # asserts in tests are fine
+"tests/_binary_fixtures.py" = ["N806"] # local consts mirror binary-spec UPPERCASE names
 "src/ioc_hunter/cli.py" = ["B008"] # typer needs function calls in defaults
 
 [tool.pytest.ini_options]

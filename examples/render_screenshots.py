@@ -68,7 +68,9 @@ def _verdict_tor() -> IOCVerdict:
         verdict=Verdict.MALICIOUS,
         confidence=0.46,
         results=(
-            _result("tor_exit", IOCType.IPV4, ioc.value, Verdict.SUSPICIOUS, 0.50, ("tor", "anonymizer")),
+            _result(
+                "tor_exit", IOCType.IPV4, ioc.value, Verdict.SUSPICIOUS, 0.50, ("tor", "anonymizer")
+            ),
             _result("urlhaus", IOCType.IPV4, ioc.value, Verdict.UNKNOWN),
             _result("threatfox", IOCType.IPV4, ioc.value, Verdict.UNKNOWN),
             _result(
@@ -79,8 +81,22 @@ def _verdict_tor() -> IOCVerdict:
                 1.00,
                 ("country:DE", "usage:Commercial", "isp:Tor-Exit traffic"),
             ),
-            _result("otx", IOCType.IPV4, ioc.value, Verdict.MALICIOUS, 1.00, ("Bruteforce", "SSH", "Honeypot")),
-            _result("virustotal", IOCType.IPV4, ioc.value, Verdict.MALICIOUS, 0.15, ("suspicious-udp", "tor")),
+            _result(
+                "otx",
+                IOCType.IPV4,
+                ioc.value,
+                Verdict.MALICIOUS,
+                1.00,
+                ("Bruteforce", "SSH", "Honeypot"),
+            ),
+            _result(
+                "virustotal",
+                IOCType.IPV4,
+                ioc.value,
+                Verdict.MALICIOUS,
+                0.15,
+                ("suspicious-udp", "tor"),
+            ),
         ),
         tags=("tor", "anonymizer", "country:DE", "Bruteforce", "SSH", "Honeypot"),
         references=(
@@ -114,18 +130,44 @@ def _verdicts_scan() -> list[IOCVerdict]:
         )
 
     return [
-        vd("CVE-2024-21762", IOCType.CVE, Verdict.MALICIOUS, 1.00, 1, 1,
-           ("actively_exploited_kev", "fortigate")),
-        vd("275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
-           IOCType.SHA256, Verdict.MALICIOUS, 0.48, 4, 4, ("windows", "malware", "ioc")),
-        vd("185.220.101.42", IOCType.IPV4, Verdict.MALICIOUS, 0.46, 6, 6,
-           ("tor", "anonymizer", "Bruteforce")),
-        vd("185.220.101.99", IOCType.IPV4, Verdict.MALICIOUS, 0.46, 6, 6,
-           ("tor", "anonymizer", "Bruteforce")),
-        vd("8.8.8.8", IOCType.IPV4, Verdict.BENIGN, 0.37, 6, 6,
-           ("country:US", "isp:Google LLC")),
-        vd("evil.com", IOCType.DOMAIN, Verdict.MALICIOUS, 0.36, 4, 4,
-           ("malware", "phishing")),
+        vd(
+            "CVE-2024-21762",
+            IOCType.CVE,
+            Verdict.MALICIOUS,
+            1.00,
+            1,
+            1,
+            ("actively_exploited_kev", "fortigate"),
+        ),
+        vd(
+            "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
+            IOCType.SHA256,
+            Verdict.MALICIOUS,
+            0.48,
+            4,
+            4,
+            ("windows", "malware", "ioc"),
+        ),
+        vd(
+            "185.220.101.42",
+            IOCType.IPV4,
+            Verdict.MALICIOUS,
+            0.46,
+            6,
+            6,
+            ("tor", "anonymizer", "Bruteforce"),
+        ),
+        vd(
+            "185.220.101.99",
+            IOCType.IPV4,
+            Verdict.MALICIOUS,
+            0.46,
+            6,
+            6,
+            ("tor", "anonymizer", "Bruteforce"),
+        ),
+        vd("8.8.8.8", IOCType.IPV4, Verdict.BENIGN, 0.37, 6, 6, ("country:US", "isp:Google LLC")),
+        vd("evil.com", IOCType.DOMAIN, Verdict.MALICIOUS, 0.36, 4, 4, ("malware", "phishing")),
         vd("https://evil.com/login.php", IOCType.URL, Verdict.SUSPICIOUS, 0.13, 4, 4),
         vd("https://evil.com/install.exe", IOCType.URL, Verdict.UNKNOWN, 0.00, 4, 4),
         vd("bad@evil.com", IOCType.EMAIL, Verdict.UNKNOWN, 0.00, 1, 1),
@@ -266,35 +308,37 @@ def render_parse_eml(console: Console) -> None:
             ioc=IOC("185.220.101.5", IOCType.IPV4),
             verdict=Verdict.MALICIOUS,
             confidence=0.62,
-            results=tuple(),
+            results=(),
             tags=("tor", "anonymizer", "Bruteforce"),
         ),
         IOCVerdict(
             ioc=IOC("203.0.113.7", IOCType.IPV4),
             verdict=Verdict.SUSPICIOUS,
             confidence=0.30,
-            results=tuple(),
+            results=(),
             tags=("bogon", "test-net-3"),
         ),
         IOCVerdict(
             ioc=IOC("evil.example", IOCType.DOMAIN),
             verdict=Verdict.MALICIOUS,
             confidence=0.55,
-            results=tuple(),
+            results=(),
             tags=("phishing", "malware"),
         ),
         IOCVerdict(
-            ioc=IOC("275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f", IOCType.SHA256),
+            ioc=IOC(
+                "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f", IOCType.SHA256
+            ),
             verdict=Verdict.MALICIOUS,
             confidence=0.48,
-            results=tuple(),
+            results=(),
             tags=("emotet", "windows"),
         ),
         IOCVerdict(
             ioc=IOC("https://login.evil.example/verify", IOCType.URL),
             verdict=Verdict.MALICIOUS,
             confidence=0.51,
-            results=tuple(),
+            results=(),
             tags=("phishing",),
         ),
     ]
@@ -318,7 +362,7 @@ def render_watch(console: Console) -> None:
                 ioc=IOC("185.220.101.5", IOCType.IPV4),
                 verdict=Verdict.MALICIOUS,
                 confidence=0.62,
-                results=tuple(),
+                results=(),
                 tags=("tor", "anonymizer", "Bruteforce", "SSH"),
             ),
             source_line=(
@@ -331,11 +375,11 @@ def render_watch(console: Console) -> None:
                 ioc=IOC("evil.example", IOCType.DOMAIN),
                 verdict=Verdict.SUSPICIOUS,
                 confidence=0.40,
-                results=tuple(),
+                results=(),
                 tags=("phishing",),
             ),
             source_line=(
-                'Jun 14 14:03:22 web01 nginx: 10.0.0.5 - - [14/Jun/2026:14:03:22] '
+                "Jun 14 14:03:22 web01 nginx: 10.0.0.5 - - [14/Jun/2026:14:03:22] "
                 '"GET /api/track?to=evil.example HTTP/1.1" 200'
             ),
         ),

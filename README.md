@@ -8,7 +8,7 @@
 [![CI](https://github.com/platinum2high/ioc-hunter/actions/workflows/ci.yml/badge.svg)](https://github.com/platinum2high/ioc-hunter/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-263%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-376%20passing-brightgreen)
 
 ---
 
@@ -64,6 +64,7 @@ message — they don't crash, just gracefully skip.
 | Correlation | none | shared-subnet + shared-tag pivots across the batch |
 | Decoding | none | base64 / hex / URL / JWT / gzip / zlib + magic auto-detect |
 | Cache | none | SQLite with TTL — survives across runs, doesn't burn API quota |
+| Binary forensics | none | static PE / ELF / Mach-O analyzer: ImpHash, Authenticode, entitlements, embedded payloads, ATT&CK techniques |
 
 ---
 
@@ -140,6 +141,7 @@ mounted as a volume so it survives across containers.
 ioc-hunter check <ioc>                       single IOC verdict
 ioc-hunter scan-file <path>                  extract + enrich every IOC in a file
 ioc-hunter parse-eml <path>                  phishing .eml — headers, body, attachments
+ioc-hunter analyze <path>                    static analysis of PE / ELF / Mach-O binaries
 ioc-hunter watch <path>                      tail a log file and alert on suspicious IOCs
 ioc-hunter correlate <path>                  shared-infra and shared-tag pivots
 ioc-hunter report <path> --format <fmt>      json | md | stix | misp | sigma | suricata
@@ -197,6 +199,45 @@ hashed (SHA-256 + MD5) and their hashes flow straight into the TI
 lookups along with body URLs, header IPs, and quoted domains.
 
 Add `--no-enrich` for an offline-only parse (no TI calls).
+
+### Analyze a suspicious binary
+
+```bash
+ioc-hunter analyze ./sample.exe
+```
+
+A pure-Python static analyzer for **PE / ELF / Mach-O** — no `pefile`, no
+`lief`, no external services. One header, one verdict, then a finding
+list mapped to **MITRE ATT&CK** techniques.
+
+What it pulls in a single pass:
+
+- **PE**: sections + entropy, imports + **ImpHash** (Mandiant pivot),
+  Authenticode signer / issuer CN, VERSIONINFO, manifest
+  (`requestedExecutionLevel`, `autoElevate`, `uiAccess`), embedded PEs in
+  resources, entry-point sanity, PE checksum recompute, timestamp
+  anomalies
+- **ELF**: program headers, dynamic imports, `.note.gnu.build-id`,
+  `.note.go.buildid`, ABI tag, RWX segments, stripped detection
+- **Mach-O**: fat-slice walker, load commands, CodeDirectory
+  (identifier + team-id + flags), parsed XML **entitlements** with
+  risky-capability classification
+- **Cross-format**: nested PE / ELF / Mach-O / ZIP / 7z / RAR / gz scan,
+  msfvenom + egghunter + Donut + Cobalt Strike beacon detection
+  (incl. XOR-0x69 / 0x2E variants), Go marker, packer fingerprinting
+  (UPX, MPRESS, ASPack, …)
+
+Heuristics fire suspicious-API combos (`VirtualAllocEx` +
+`WriteProcessMemory` + `CreateRemoteThread` → **T1055**), RWX sections,
+debug strings, mismatched extensions. Each finding carries a severity,
+a one-line rationale, and (where applicable) ATT&CK technique IDs.
+
+Flags:
+
+- `--json` — full structured report (Jira / SIEM-ready)
+- `--md` — Markdown summary for tickets and Slack
+- `--strings` — preview of extracted printable strings
+- `--no-enrich` — skip TI lookups on embedded IOCs
 
 ### Watch a log file live
 
@@ -355,6 +396,7 @@ Every push to `main` redeploys automatically. Health endpoint at
 | `exporters/` | JSON, Markdown, STIX 2.1, MISP Event |
 | `rules/` | Sigma + Suricata generators with severity floor |
 | `decoder/` | CyberChef-style operations + magic auto-detect |
+| `analyze/` | Static PE / ELF / Mach-O analyzer, ImpHash, Authenticode, entitlements, embedded scan, ATT&CK map |
 | `cli.py` | Rich-powered terminal UI |
 
 ---
@@ -397,8 +439,9 @@ All planned phases done.
 | 11 — Docker, CI, README | ✅ |
 | 12 — .eml parser, watch-mode, NetMeta source | ✅ |
 | 13 — FastAPI web demo + Render Blueprint | ✅ |
+| 14.1 — static PE / ELF / Mach-O analyzer + ATT&CK map | ✅ |
 
-**263 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
+**376 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
 Docker build, `ruff` lint + format check, and `gitleaks` secret scan on
 every push.
 

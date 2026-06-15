@@ -4,6 +4,7 @@ Commands:
     ioc-hunter check <ioc>            single-IOC lookup
     ioc-hunter scan-file <path>       extract + enrich every IOC in a file
     ioc-hunter parse-eml <path>       parse phishing .eml — headers, body, attachments
+    ioc-hunter analyze <path>         static analysis of PE / ELF / Mach-O binaries
     ioc-hunter watch <path>           tail a log file and alert on suspicious IOCs
     ioc-hunter correlate <path>       find pivots across a batch of IOCs
     ioc-hunter report <path>          render JSON / Markdown / STIX / MISP / Sigma / Suricata
@@ -26,6 +27,12 @@ from rich.panel import Panel
 from rich.table import Table
 
 from ioc_hunter import __version__
+from ioc_hunter.analyze import (
+    AnalyzerReport,
+    Severity,
+    analyze,
+)
+from ioc_hunter.analyze import Verdict as AnalyzerVerdict
 from ioc_hunter.cache import TICache
 from ioc_hunter.config import Settings
 from ioc_hunter.core import IOC, defang, detect_type, extract_iocs, parse_eml, refang
@@ -379,6 +386,381 @@ def parse_eml_cmd(
     no_cache: bool = typer.Option(False, "--no-cache", help="Skip the SQLite cache."),
 ) -> None:
     exit_code = asyncio.run(_run_parse_eml(path, enrich=not no_enrich, use_cache=not no_cache))
+    raise typer.Exit(exit_code)
+
+
+# ---------------------------------------------------------------------------
+# `analyze` — binary forensics for PE / ELF / Mach-O
+# ---------------------------------------------------------------------------
+
+
+_SEVERITY_STYLES: dict[Severity, tuple[str, str]] = {
+    Severity.INFO: ("INFO", "dim"),
+    Severity.LOW: ("LOW", "blue"),
+    Severity.MEDIUM: ("MEDIUM", "yellow"),
+    Severity.HIGH: ("HIGH", "red"),
+    Severity.CRITICAL: ("CRITICAL", "bold red"),
+}
+
+
+_VERDICT_TEXT: dict[AnalyzerVerdict, tuple[str, str]] = {
+    AnalyzerVerdict.CLEAN: ("CLEAN", "bold green"),
+    AnalyzerVerdict.SUSPICIOUS: ("SUSPICIOUS", "bold yellow"),
+    AnalyzerVerdict.MALICIOUS: ("MALICIOUS", "bold red"),
+}
+
+
+def _entropy_bar(value: float, width: int = 10) -> str:
+    """ASCII bar for entropy in 0..8. Colours by bucket."""
+    pct = max(0.0, min(1.0, value / 8.0))
+    filled = round(pct * width)
+    if value >= 7.5:
+        color = "red"
+    elif value >= 6.5:
+        color = "yellow"
+    else:
+        color = "green"
+    bar = "█" * filled + "░" * (width - filled)
+    return f"[{color}]{bar}[/]"
+
+
+def _render_analyze_header(report: AnalyzerReport) -> None:
+    label, style = _VERDICT_TEXT[report.verdict]
+    lines = [
+        f"[bold cyan]File:[/] {_escape_markup(report.path)}",
+        f"[dim]Format:[/]  {report.format.value.upper()}  "
+        f"[dim]Arch:[/] {report.architecture or '—'}  "
+        f"[dim]Bits:[/] {report.bitness or '—'}",
+        f"[dim]Size:[/]    {report.file_size:,} bytes  "
+        f"[dim]Entropy:[/] {report.overall_entropy:.2f}  "
+        f"[dim]Sections:[/] {len(report.sections)}",
+        f"[dim]MD5:[/]     {report.md5}",
+        f"[dim]SHA1:[/]    {report.sha1}",
+        f"[dim]SHA256:[/]  {report.sha256}",
+    ]
+    if report.entry_point:
+        lines.append(f"[dim]Entry:[/]   0x{report.entry_point:x}")
+    if report.compiler:
+        lines.append(f"[dim]Compiler:[/] {_escape_markup(report.compiler)}")
+    if report.imphash:
+        lines.append(f"[dim]ImpHash:[/] {report.imphash}")
+    if report.build_id:
+        lines.append(f"[dim]BuildID:[/] {report.build_id}")
+    if report.signer_cn:
+        lines.append(f"[dim]Signer:[/]  {_escape_markup(report.signer_cn)}")
+    if report.issuer_cn:
+        lines.append(f"[dim]Issuer:[/]  {_escape_markup(report.issuer_cn)}")
+    flags = []
+    if report.is_signed:
+        flags.append("[green]signed[/]")
+    if report.is_packed:
+        packer = f" ({_escape_markup(report.detected_packer)})" if report.detected_packer else ""
+        flags.append(f"[red]packed[/]{packer}")
+    if report.is_stripped:
+        flags.append("[yellow]stripped[/]")
+    if report.has_overlay:
+        flags.append(f"[yellow]overlay[/] ({report.overlay_size:,} bytes)")
+    if flags:
+        lines.append("[dim]Flags:[/]   " + ", ".join(flags))
+    lines.append(
+        f"\n[{style}]VERDICT: {label}[/]  "
+        f"[dim]({len(report.findings)} finding(s), confidence {report.confidence():.0%})[/]"
+    )
+    console.print(Panel.fit("\n".join(lines), title="Binary Analyzer", border_style=style))
+
+
+def _render_analyze_sections(report: AnalyzerReport) -> None:
+    if not report.sections:
+        return
+    table = Table(title="Sections / Segments", box=SIMPLE, show_lines=False)
+    table.add_column("Name", style="cyan", overflow="fold")
+    table.add_column("VSize", justify="right", style="dim")
+    table.add_column("RSize", justify="right", style="dim")
+    table.add_column("Entropy", justify="right")
+    table.add_column("Bar", no_wrap=True)
+    table.add_column("Perms")
+    for s in report.sections[:40]:
+        table.add_row(
+            _escape_markup(s.name) or "<unnamed>",
+            f"{s.virtual_size:,}",
+            f"{s.raw_size:,}",
+            f"{s.entropy:.2f}",
+            _entropy_bar(s.entropy),
+            s.flags,
+        )
+    if len(report.sections) > 40:
+        table.add_row("…", "", "", "", "", f"+{len(report.sections) - 40} more")
+    console.print(table)
+
+
+def _render_analyze_imports(report: AnalyzerReport) -> None:
+    if not report.imports:
+        return
+    table = Table(title=f"Imports ({len(report.imports)} libs)", box=SIMPLE, show_lines=False)
+    table.add_column("Library", style="cyan", overflow="fold")
+    table.add_column("Count", justify="right")
+    table.add_column("Sample symbols", overflow="fold", style="dim")
+    for imp in report.imports[:30]:
+        sample = ", ".join(imp.symbols[:6])
+        if len(imp.symbols) > 6:
+            sample += f", … +{len(imp.symbols) - 6}"
+        table.add_row(_escape_markup(imp.library), str(len(imp.symbols)), _escape_markup(sample))
+    if len(report.imports) > 30:
+        rest = sum(len(i.symbols) for i in report.imports[30:])
+        table.add_row("…", "", f"+{len(report.imports) - 30} libs / {rest} symbols")
+    console.print(table)
+
+
+def _render_analyze_findings(report: AnalyzerReport) -> None:
+    if not report.findings:
+        console.print("[green]No findings — clean by every rule we apply.[/]")
+        return
+    table = Table(title=f"Findings ({len(report.findings)})", box=SIMPLE, show_lines=False)
+    table.add_column("Severity", no_wrap=True)
+    table.add_column("Category", style="dim")
+    table.add_column("ATT&CK", style="magenta", no_wrap=True)
+    table.add_column("Rule", style="cyan")
+    table.add_column("Message", overflow="fold")
+    # Sort by severity desc.
+    for f in sorted(report.findings, key=lambda x: -int(x.severity)):
+        label, style = _SEVERITY_STYLES[f.severity]
+        techniques = ", ".join(f.mitre) if f.mitre else "—"
+        table.add_row(
+            f"[{style}]{label}[/]",
+            f.category,
+            techniques,
+            f.rule,
+            _escape_markup(f.message),
+        )
+    console.print(table)
+
+
+def _render_analyze_extras(report: AnalyzerReport) -> None:
+    """VERSIONINFO + Manifest + entitlements blocks."""
+    if report.version_info:
+        table = Table(title="VERSIONINFO", box=SIMPLE)
+        table.add_column("Key", style="cyan")
+        table.add_column("Value", overflow="fold")
+        for k, v in report.version_info.items():
+            table.add_row(k, _escape_markup(v))
+        console.print(table)
+    if report.manifest:
+        table = Table(title="Manifest", box=SIMPLE)
+        table.add_column("Key", style="cyan")
+        table.add_column("Value", overflow="fold")
+        for k, v in report.manifest.items():
+            table.add_row(k, _escape_markup(v))
+        console.print(table)
+    if report.entitlements:
+        console.print(
+            Panel.fit(
+                "\n".join(f"• {_escape_markup(e)}" for e in report.entitlements[:30]),
+                title=f"Entitlements ({len(report.entitlements)})",
+                border_style="magenta",
+            )
+        )
+
+
+def _render_analyze_iocs(report: AnalyzerReport) -> None:
+    if not report.iocs:
+        return
+    table = Table(title=f"IOCs extracted ({len(report.iocs)})", box=SIMPLE, show_lines=False)
+    table.add_column("IOC", style="cyan", overflow="fold")
+    table.add_column("Type", style="dim")
+    for ioc in report.iocs[:40]:
+        table.add_row(_safe(ioc.value), ioc.type.value)
+    if len(report.iocs) > 40:
+        table.add_row("…", f"+{len(report.iocs) - 40} more")
+    console.print(table)
+
+
+def _report_to_jsonable(report: AnalyzerReport) -> dict:
+    """Project the dataclass into a JSON-safe dict.
+
+    We do this by hand (rather than ``dataclasses.asdict``) because the
+    findings/IOCs/sections nested dataclasses are exactly the fields we
+    want, but enums need ``.value`` flattening.
+    """
+    return {
+        "path": report.path,
+        "format": report.format.value,
+        "file_size": report.file_size,
+        "truncated": report.truncated,
+        "md5": report.md5,
+        "sha1": report.sha1,
+        "sha256": report.sha256,
+        "architecture": report.architecture,
+        "bitness": report.bitness,
+        "entry_point": report.entry_point,
+        "timestamp": report.timestamp,
+        "compiler": report.compiler,
+        "overall_entropy": report.overall_entropy,
+        "has_overlay": report.has_overlay,
+        "overlay_size": report.overlay_size,
+        "overlay_entropy": report.overlay_entropy,
+        "is_signed": report.is_signed,
+        "is_stripped": report.is_stripped,
+        "is_packed": report.is_packed,
+        "detected_packer": report.detected_packer,
+        "imphash": report.imphash,
+        "signer_cn": report.signer_cn,
+        "issuer_cn": report.issuer_cn,
+        "build_id": report.build_id,
+        "version_info": report.version_info,
+        "manifest": report.manifest,
+        "entitlements": list(report.entitlements),
+        "verdict": report.verdict.value,
+        "confidence": report.confidence(),
+        "sections": [
+            {
+                "name": s.name,
+                "virtual_size": s.virtual_size,
+                "raw_size": s.raw_size,
+                "file_offset": s.file_offset,
+                "entropy": s.entropy,
+                "flags": s.flags,
+            }
+            for s in report.sections
+        ],
+        "imports": [{"library": i.library, "symbols": list(i.symbols)} for i in report.imports],
+        "exports": [{"name": e.name, "ordinal": e.ordinal} for e in report.exports],
+        "linked_libraries": list(report.linked_libraries),
+        "findings": [
+            {
+                "rule": f.rule,
+                "severity": int(f.severity),
+                "severity_label": _SEVERITY_STYLES[f.severity][0],
+                "category": f.category,
+                "message": f.message,
+                "evidence": list(f.evidence),
+                "mitre": list(f.mitre),
+            }
+            for f in report.findings
+        ],
+        "iocs": [{"value": ioc.value, "type": ioc.type.value} for ioc in report.iocs],
+        "metadata": report.metadata,
+    }
+
+
+async def _run_analyze(
+    path: Path,
+    *,
+    enrich: bool,
+    use_cache: bool,
+    as_json: bool,
+    as_md: bool,
+    show_strings: bool,
+) -> int:
+    try:
+        report = analyze(path)
+    except OSError as exc:
+        console.print(f"[red]Cannot read file:[/] {exc}")
+        return 2
+
+    if as_md:
+        from ioc_hunter.analyze import to_markdown as _to_md
+
+        print(_to_md(report))
+        return 0
+
+    if as_json:
+        import json as _json
+
+        payload = _report_to_jsonable(report)
+        if enrich and report.iocs:
+            verdicts = await _enrich_for_json(report.iocs, use_cache=use_cache)
+            payload["enriched"] = [
+                {
+                    "ioc": v.ioc.value,
+                    "type": v.ioc.type.value,
+                    "verdict": str(v.verdict),
+                    "confidence": v.confidence,
+                    "tags": list(v.tags),
+                }
+                for v in verdicts
+            ]
+        console.print_json(_json.dumps(payload))
+        return 0
+
+    _render_analyze_header(report)
+    _render_analyze_extras(report)
+    _render_analyze_sections(report)
+    _render_analyze_imports(report)
+    _render_analyze_findings(report)
+    _render_analyze_iocs(report)
+
+    if show_strings and report.strings:
+        console.print(f"\n[bold]Strings:[/] {len(report.strings):,} extracted")
+        for s in report.strings[:40]:
+            console.print(f"  {_escape_markup(s)}")
+
+    if not enrich or not report.iocs:
+        return 0
+
+    settings = Settings.from_env()
+    cache = _open_cache(settings, use_cache)
+    try:
+        async with httpx.AsyncClient() as client:
+            engine = _build_engine(client, settings, cache)
+            if not engine.active_sources:
+                console.print(
+                    "\n[yellow]No active TI sources — skipping IOC enrichment.[/]  "
+                    "[dim]Run `ioc-hunter configure` to add keys, or pass --no-enrich.[/]"
+                )
+                return 0
+            with console.status(
+                f"Enriching {len(report.iocs)} IOC(s) across {len(engine.active_sources)} source(s)..."
+            ):
+                verdicts = await engine.lookup_many(report.iocs)
+    finally:
+        if cache is not None:
+            cache.close()
+
+    console.print()
+    _render_batch_table(verdicts)
+    return 0
+
+
+async def _enrich_for_json(iocs, *, use_cache: bool):
+    settings = Settings.from_env()
+    cache = _open_cache(settings, use_cache)
+    try:
+        async with httpx.AsyncClient() as client:
+            engine = _build_engine(client, settings, cache)
+            if not engine.active_sources:
+                return []
+            return await engine.lookup_many(iocs)
+    finally:
+        if cache is not None:
+            cache.close()
+
+
+@app.command(
+    name="analyze",
+    help="Deep static analysis of a PE / ELF / Mach-O binary.",
+)
+def analyze_cmd(
+    path: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, resolve_path=True),
+    no_enrich: bool = typer.Option(
+        False, "--no-enrich", help="Show IOCs without TI lookups (offline mode)."
+    ),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Skip the SQLite cache."),
+    as_json: bool = typer.Option(False, "--json", help="Emit the full report as JSON."),
+    as_md: bool = typer.Option(False, "--md", help="Emit the report as Jira/Slack-ready Markdown."),
+    show_strings: bool = typer.Option(
+        False, "--strings", help="Also print a preview of extracted strings."
+    ),
+) -> None:
+    exit_code = asyncio.run(
+        _run_analyze(
+            path,
+            enrich=not no_enrich,
+            use_cache=not no_cache,
+            as_json=as_json,
+            as_md=as_md,
+            show_strings=show_strings,
+        )
+    )
     raise typer.Exit(exit_code)
 
 
