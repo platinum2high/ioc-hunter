@@ -83,6 +83,37 @@ _MAP: dict[str, tuple[str, ...]] = {
     "pe.entry_in_nonexec_section": ("T1027",),
     "pe.timestamp_ancient": ("T1070.006",),  # Timestomp
     "pe.timestamp_future": ("T1070.006",),
+    # ---- PDF document analyzer (phase 14.2a) -------------------------------
+    "pdf.javascript": ("T1059.005", "T1204.002"),  # VB scripting / User Execution
+    "pdf.js_shortform": ("T1059.005", "T1204.002"),
+    "pdf.auto_javascript": ("T1059.005", "T1204.002"),
+    "pdf.launch_action": ("T1204.002", "T1218"),  # User Execution / System Binary Proxy
+    "pdf.gotor_remote": ("T1187",),  # Forced Authentication (UNC → SMB NTLM leak)
+    "pdf.submit_form": ("T1567",),  # Exfiltration Over Web Service
+    "pdf.rich_media": ("T1203",),  # Exploitation for Client Execution
+    "pdf.jbig2_filter": ("T1203",),
+    "pdf.embedded_file": ("T1027.009", "T1204.002"),  # Embedded Payloads
+    "pdf.open_action": ("T1204.002",),
+    "pdf.additional_actions": ("T1204.002",),
+    "pdf.js_obfuscation": ("T1027", "T1059.005"),
+    "pdf.filter_chain": ("T1027",),
+    "pdf.uri": ("T1204.001",),  # Malicious Link
+    "pdf.movie": ("T1203",),
+    # ---- OOXML / OLE / VBA (phase 14.2a) -----------------------------------
+    "ooxml.macro_enabled": ("T1204.002", "T1566.001"),
+    "ooxml.external_relationship": ("T1221", "T1566.001"),  # Template Injection
+    "ooxml.msdt_scheme": ("T1218", "T1566.001"),  # Follina (CVE-2022-30190)
+    "ooxml.dde_field": ("T1559.002", "T1204.002"),  # Dynamic Data Exchange
+    "ole.vba_project": ("T1204.002", "T1566.001"),
+    "ole.equation_editor": ("T1203",),  # CVE-2017-11882
+    "ole.suspicious_clsid": ("T1218",),
+    "ole.ole10native": ("T1027.009", "T1204.002"),
+    "vba.auto_exec": ("T1204.002", "T1137.001"),  # Office Application Startup
+    "vba.suspicious_api": ("T1059.005",),
+    "vba.lolbin_spawn": ("T1218", "T1059"),
+    "vba.encoded_powershell": ("T1027", "T1059.001", "T1059.005"),
+    "vba.obfuscation_density": ("T1027",),
+    "vba.obfuscation_present": ("T1027",),
 }
 
 

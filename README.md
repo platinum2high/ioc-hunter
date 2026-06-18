@@ -8,7 +8,7 @@
 [![CI](https://github.com/platinum2high/ioc-hunter/actions/workflows/ci.yml/badge.svg)](https://github.com/platinum2high/ioc-hunter/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-376%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-434%20passing-brightgreen)
 
 ---
 
@@ -65,6 +65,7 @@ message — they don't crash, just gracefully skip.
 | Decoding | none | base64 / hex / URL / JWT / gzip / zlib + magic auto-detect |
 | Cache | none | SQLite with TTL — survives across runs, doesn't burn API quota |
 | Binary forensics | none | static PE / ELF / Mach-O analyzer: ImpHash, Authenticode, entitlements, embedded payloads, ATT&CK techniques |
+| Document forensics | none | PDF / OOXML / OLE analyzer: PDF actions, MS-OVBA decompressor, Follina/template-injection, Equation Editor, embedded payload extraction |
 
 ---
 
@@ -239,6 +240,74 @@ Flags:
 - `--strings` — preview of extracted printable strings
 - `--no-enrich` — skip TI lookups on embedded IOCs
 
+### Analyze a suspicious document
+
+`ioc-hunter analyze` also handles **PDF / OOXML / OLE** with the same
+single command. The dispatcher autodetects the format from magic bytes
+and routes to a dedicated parser — all pure Python, no `pdfminer`, no
+`olefile`, no `python-docx`.
+
+```bash
+ioc-hunter analyze quarterly-report.pdf
+ioc-hunter analyze suspicious.docm
+ioc-hunter analyze legacy.doc
+```
+
+**PDF**:
+
+- `xref` table + indirect-object walker; falls back to a regex scan
+  on tampered xrefs (real malicious PDFs break them on purpose)
+- Action keys: `/JavaScript`, `/Launch`, `/OpenAction`, `/AA`,
+  `/EmbeddedFile`, `/RichMedia`, `/JBIG2Decode`, `/GoToR`,
+  `/SubmitForm`, `/URI`
+- **Auto-fire escalation**: `/OpenAction` or `/AA` combined with
+  `/JavaScript` → CRITICAL — strongest single signal of a malicious PDF
+- `FlateDecode` streams are zlib-decompressed; URLs hidden inside
+  JavaScript bodies flow into the TI sweep
+
+**OOXML** (.docm / .xlsm / .pptm / docx / xlsx / pptx):
+
+- ZIP walker via stdlib `zipfile`; subtype detection from
+  `[Content_Types].xml`
+- **External relationships**: scans `*_rels/*.xml.rels` for
+  `TargetMode="External"` + dangerous types (attachedTemplate,
+  oleObject, frame, subDocument, …) — Follina /
+  **CVE-2022-30190** / template-injection IOC
+- `ms-msdt:` / `ms-search-ms:` URI schemes → CRITICAL
+- DDE-in-`sharedStrings.xml` (`=cmd|`, `=DDEAuto`)
+- `vbaProject.bin` extracted and handed to the VBA analyzer
+
+**OLE / CFB** (legacy .doc, .xls, .ppt, .msi, bare `vbaProject.bin`):
+
+- Full **MS-CFB parser**: 512-byte header, FAT chain with DiFAT
+  extension, directory red-black-tree walker (UTF-16LE names),
+  MiniFAT for streams under 4 KiB
+- **`Equation Native` stream** detection → CVE-2017-11882 / CVE-2018-0802
+- Suspicious CLSIDs (Equation Editor, Packager)
+- `\x01Ole10Native` Packager-based file drops
+
+**VBA decompressor** ([MS-OVBA] §2.4.1):
+
+- Full **CompressedAtom decoder**: chunk-header signature bit + type
+  bits + size-minus-three field; literal/copy token machinery with
+  the bit-count split derived per decompressed position
+- PerformanceCache prefix skip via signature-byte scan (no need to
+  parse the `dir` stream)
+- Heuristics on decoded VBA source:
+  - **Auto-exec subs** (`AutoOpen`, `Workbook_Open`, `Document_Open`,
+    …) → HIGH, T1204.002 + T1137.001
+  - **Suspicious COM bridges** (`WScript.Shell`, `MSXML2.XMLHTTP`,
+    `ADODB.Stream`, `WinHttp.WinHttpRequest`, …) → HIGH, T1059.005
+  - **LOLBin spawn** (`powershell`, `mshta`, `rundll32`, `regsvr32`,
+    `certutil`, `bitsadmin`, …) → HIGH, T1218 + T1059
+  - **Encoded-PowerShell markers** (`-enc`, `FromBase64String`,
+    `DownloadString`, …) → CRITICAL, T1027 + T1059.001
+  - **Obfuscation primitive density** (`Chr`/`StrReverse`/`Asc`) → MEDIUM
+
+Every doc finding is mapped to MITRE ATT&CK by the same tagger used
+for binaries — `analyze --json` and `--md` both render the techniques
+inline.
+
 ### Watch a log file live
 
 ```bash
@@ -396,7 +465,7 @@ Every push to `main` redeploys automatically. Health endpoint at
 | `exporters/` | JSON, Markdown, STIX 2.1, MISP Event |
 | `rules/` | Sigma + Suricata generators with severity floor |
 | `decoder/` | CyberChef-style operations + magic auto-detect |
-| `analyze/` | Static PE / ELF / Mach-O analyzer, ImpHash, Authenticode, entitlements, embedded scan, ATT&CK map |
+| `analyze/` | Static PE / ELF / Mach-O / PDF / OOXML / OLE analyzer + MS-OVBA decompressor + ATT&CK map |
 | `cli.py` | Rich-powered terminal UI |
 
 ---
@@ -440,8 +509,9 @@ All planned phases done.
 | 12 — .eml parser, watch-mode, NetMeta source | ✅ |
 | 13 — FastAPI web demo + Render Blueprint | ✅ |
 | 14.1 — static PE / ELF / Mach-O analyzer + ATT&CK map | ✅ |
+| 14.2a — PDF / OOXML / OLE analyzer + MS-OVBA decompressor + Follina detection | ✅ |
 
-**376 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
+**434 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
 Docker build, `ruff` lint + format check, and `gitleaks` secret scan on
 every push.
 

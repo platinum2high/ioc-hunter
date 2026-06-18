@@ -45,6 +45,9 @@ from ioc_hunter.analyze.macho import (
     analyze_macho,
     parse_fat_header,
 )
+from ioc_hunter.analyze.ole import CFB_SIGNATURE, analyze_ole
+from ioc_hunter.analyze.ooxml import analyze_ooxml, is_ooxml
+from ioc_hunter.analyze.pdf import analyze_pdf
 from ioc_hunter.analyze.pe import analyze_pe
 
 _CHUNK = 1024 * 1024  # 1 MiB streaming-hash chunk
@@ -62,6 +65,12 @@ def detect_format(head: bytes) -> FileFormat:
         return FileFormat.PE
     if head[:4] == b"\x7fELF":
         return FileFormat.ELF
+    if head[:5] == b"%PDF-":
+        return FileFormat.PDF
+    if head[:8] == CFB_SIGNATURE:
+        return FileFormat.OLE
+    if head[:2] == b"PK" and head[2:4] in (b"\x03\x04", b"\x05\x06", b"\x07\x08"):
+        return FileFormat.OOXML
     magic = int.from_bytes(head[:4], "little")
     if magic in (MH_MAGIC, MH_MAGIC_64, MH_CIGAM, MH_CIGAM_64):
         return FileFormat.MACHO
@@ -145,6 +154,12 @@ def analyze(path: str | Path, *, want_strings: bool = True) -> AnalyzerReport:
         analyze_pe(raw, report=report)
     elif fmt == FileFormat.ELF:
         analyze_elf(raw, report=report)
+    elif fmt == FileFormat.PDF:
+        analyze_pdf(raw, report=report)
+    elif fmt == FileFormat.OOXML and is_ooxml(raw):
+        analyze_ooxml(raw, report=report)
+    elif fmt == FileFormat.OLE:
+        analyze_ole(raw, report=report)
     elif fmt == FileFormat.MACHO:
         analyze_macho(raw, report=report, slice_offset=0)
     elif fmt == FileFormat.MACHO_FAT:
@@ -178,7 +193,12 @@ def analyze(path: str | Path, *, want_strings: bool = True) -> AnalyzerReport:
         )
 
     # ---- Strings + IOC sweep -- always run; cheap on the buffer we have ---
-    strings = extract_all_strings(raw, cap=MAX_STRINGS)
+    # PDFs (FlateDecode JS), OOXML (decoded VBA + embedded payloads), and
+    # OLE (decoded VBA) stash extra bytes in `pdf_decoded_blob` so they
+    # flow into the IOC sweep here.
+    pdf_blob = report.metadata.pop("pdf_decoded_blob", b"")
+    sweep_buf = raw + b"\n" + pdf_blob if pdf_blob else raw
+    strings = extract_all_strings(sweep_buf, cap=MAX_STRINGS)
     iocs = sweep_iocs(strings)
     report.iocs = iocs
     if want_strings:

@@ -80,6 +80,9 @@ class FileFormat(StrEnum):
     ELF = "elf"
     MACHO = "macho"
     MACHO_FAT = "macho_fat"
+    PDF = "pdf"
+    OOXML = "ooxml"  # ZIP-based Office (.docx, .docm, .xlsm, .pptm, ...)
+    OLE = "ole"  # Compound File Binary (.doc, .xls, .ppt, .msi, vbaProject.bin)
     UNKNOWN = "unknown"
 
 
