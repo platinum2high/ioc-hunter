@@ -80,6 +80,7 @@ class FileFormat(StrEnum):
     ELF = "elf"
     MACHO = "macho"
     MACHO_FAT = "macho_fat"
+    PDF = "pdf"
     UNKNOWN = "unknown"
 
 

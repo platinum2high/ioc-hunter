@@ -83,6 +83,22 @@ _MAP: dict[str, tuple[str, ...]] = {
     "pe.entry_in_nonexec_section": ("T1027",),
     "pe.timestamp_ancient": ("T1070.006",),  # Timestomp
     "pe.timestamp_future": ("T1070.006",),
+    # ---- PDF document analyzer (phase 14.2a) -------------------------------
+    "pdf.javascript": ("T1059.005", "T1204.002"),  # VB scripting / User Execution
+    "pdf.js_shortform": ("T1059.005", "T1204.002"),
+    "pdf.auto_javascript": ("T1059.005", "T1204.002"),
+    "pdf.launch_action": ("T1204.002", "T1218"),  # User Execution / System Binary Proxy
+    "pdf.gotor_remote": ("T1187",),  # Forced Authentication (UNC → SMB NTLM leak)
+    "pdf.submit_form": ("T1567",),  # Exfiltration Over Web Service
+    "pdf.rich_media": ("T1203",),  # Exploitation for Client Execution
+    "pdf.jbig2_filter": ("T1203",),
+    "pdf.embedded_file": ("T1027.009", "T1204.002"),  # Embedded Payloads
+    "pdf.open_action": ("T1204.002",),
+    "pdf.additional_actions": ("T1204.002",),
+    "pdf.js_obfuscation": ("T1027", "T1059.005"),
+    "pdf.filter_chain": ("T1027",),
+    "pdf.uri": ("T1204.001",),  # Malicious Link
+    "pdf.movie": ("T1203",),
 }
 
 
