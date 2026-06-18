@@ -114,6 +114,17 @@ _MAP: dict[str, tuple[str, ...]] = {
     "vba.encoded_powershell": ("T1027", "T1059.001", "T1059.005"),
     "vba.obfuscation_density": ("T1027",),
     "vba.obfuscation_present": ("T1027",),
+    # ---- RTF analyzer (phase 14.2b) ----------------------------------------
+    "rtf.equation_editor_3": ("T1203", "T1566.001"),  # CVE-2017-11882
+    "rtf.equation_editor_2": ("T1203", "T1566.001"),  # CVE-2018-0802
+    "rtf.ole2link": ("T1203", "T1566.001"),  # CVE-2017-0199
+    "rtf.package_dropper": ("T1027.009", "T1204.002"),
+    "rtf.embedded_word": ("T1566.001",),
+    "rtf.auto_object_fire": ("T1204.002", "T1203"),
+    "rtf.objocx": ("T1559.001", "T1204.002"),  # Component Object Model
+    "rtf.raw_binary_blob": ("T1027",),
+    "rtf.embedded_cfb": ("T1027.009", "T1203"),
+    "rtf.equation_native_payload": ("T1203", "T1566.001"),
 }
 
 

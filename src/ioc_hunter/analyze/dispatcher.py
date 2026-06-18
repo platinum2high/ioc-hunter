@@ -49,6 +49,7 @@ from ioc_hunter.analyze.ole import CFB_SIGNATURE, analyze_ole
 from ioc_hunter.analyze.ooxml import analyze_ooxml, is_ooxml
 from ioc_hunter.analyze.pdf import analyze_pdf
 from ioc_hunter.analyze.pe import analyze_pe
+from ioc_hunter.analyze.rtf import analyze_rtf, is_rtf
 
 _CHUNK = 1024 * 1024  # 1 MiB streaming-hash chunk
 
@@ -71,6 +72,8 @@ def detect_format(head: bytes) -> FileFormat:
         return FileFormat.OLE
     if head[:2] == b"PK" and head[2:4] in (b"\x03\x04", b"\x05\x06", b"\x07\x08"):
         return FileFormat.OOXML
+    if is_rtf(head):
+        return FileFormat.RTF
     magic = int.from_bytes(head[:4], "little")
     if magic in (MH_MAGIC, MH_MAGIC_64, MH_CIGAM, MH_CIGAM_64):
         return FileFormat.MACHO
@@ -160,6 +163,8 @@ def analyze(path: str | Path, *, want_strings: bool = True) -> AnalyzerReport:
         analyze_ooxml(raw, report=report)
     elif fmt == FileFormat.OLE:
         analyze_ole(raw, report=report)
+    elif fmt == FileFormat.RTF:
+        analyze_rtf(raw, report=report)
     elif fmt == FileFormat.MACHO:
         analyze_macho(raw, report=report, slice_offset=0)
     elif fmt == FileFormat.MACHO_FAT:

@@ -108,3 +108,25 @@ class TestAnalyzeOle:
         # We don't claim a verdict here (depends on VBA content); just
         # make sure the analyzer fired without crashing.
         assert r.verdict in (Verdict.CLEAN, Verdict.SUSPICIOUS, Verdict.MALICIOUS)
+
+
+class TestSubtype:
+    def test_word_doc_subtype(self):
+        cfb = build_minimal_cfb({"WordDocument": b"x" * 5000})
+        r = analyze_ole(cfb, report=_new_report())
+        assert r.metadata.get("ole_subtype") == "doc"
+
+    def test_excel_subtype(self):
+        cfb = build_minimal_cfb({"Workbook": b"x" * 5000})
+        r = analyze_ole(cfb, report=_new_report())
+        assert r.metadata.get("ole_subtype") == "xls"
+
+    def test_powerpoint_subtype(self):
+        cfb = build_minimal_cfb({"PowerPoint Document": b"x" * 5000})
+        r = analyze_ole(cfb, report=_new_report())
+        assert r.metadata.get("ole_subtype") == "ppt"
+
+    def test_bare_vba_project_subtype(self):
+        cfb = build_minimal_cfb({"VBA/dir": b"x" * 5000, "VBA/Module1": b"y" * 5000})
+        r = analyze_ole(cfb, report=_new_report())
+        assert r.metadata.get("ole_subtype") == "vba_project"

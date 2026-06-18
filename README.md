@@ -8,7 +8,7 @@
 [![CI](https://github.com/platinum2high/ioc-hunter/actions/workflows/ci.yml/badge.svg)](https://github.com/platinum2high/ioc-hunter/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-434%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-454%20passing-brightgreen)
 
 ---
 
@@ -26,27 +26,19 @@ below.
 
 ## ⚡ Works keyless out of the box
 
-You don't need any API keys to try it. Clone, install, run — **two
-sources work immediately** with no signup:
+You don't need any API keys to try it. Two sources work immediately
+with no signup, the other five register in under a minute each. See
+[`Install`](#install) for the full walk-through.
 
 - **Tor exit** — flags traffic from Tor relays
-- **NetMeta** — offline classifier for bogon / private / CGNAT / reserved
-  IP ranges (RFC 1918, RFC 5737, RFC 6598, RFC 6890). A `test-net` or
-  `240/4` IP in a production log = misconfig or spoofed traffic.
+- **NetMeta** — offline classifier for bogon / private / CGNAT /
+  reserved IP ranges (RFC 1918, RFC 5737, RFC 6598, RFC 6890). A
+  `test-net` or `240/4` IP in a production log = misconfig or
+  spoofed traffic.
 
-```bash
-git clone https://github.com/platinum2high/ioc-hunter
-cd ioc-hunter
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-ioc-hunter check "185[.]220[.]101[.]42"   # ← works right now, no key needed
-```
-
-For **the other five sources** (URLhaus, ThreatFox, AbuseIPDB, OTX,
-VirusTotal) you need free API keys — they all register in under a minute
-and the tool walks you through it with `ioc-hunter configure`. Without
-them, those sources return `UNKNOWN` with a clear "missing API key"
-message — they don't crash, just gracefully skip.
+Without keys, the keyed sources (URLhaus, ThreatFox, AbuseIPDB, OTX,
+VirusTotal) return `UNKNOWN` with a clear "missing API key" message —
+they don't crash, just gracefully skip.
 
 ---
 
@@ -65,7 +57,7 @@ message — they don't crash, just gracefully skip.
 | Decoding | none | base64 / hex / URL / JWT / gzip / zlib + magic auto-detect |
 | Cache | none | SQLite with TTL — survives across runs, doesn't burn API quota |
 | Binary forensics | none | static PE / ELF / Mach-O analyzer: ImpHash, Authenticode, entitlements, embedded payloads, ATT&CK techniques |
-| Document forensics | none | PDF / OOXML / OLE analyzer: PDF actions, MS-OVBA decompressor, Follina/template-injection, Equation Editor, embedded payload extraction |
+| Document forensics | none | PDF / OOXML / OLE / RTF analyzer: PDF actions, MS-OVBA decompressor, Follina/template-injection, Equation Editor (CVE-2017-11882), OLE2Link (CVE-2017-0199), embedded payload extraction |
 
 ---
 
@@ -142,7 +134,7 @@ mounted as a volume so it survives across containers.
 ioc-hunter check <ioc>                       single IOC verdict
 ioc-hunter scan-file <path>                  extract + enrich every IOC in a file
 ioc-hunter parse-eml <path>                  phishing .eml — headers, body, attachments
-ioc-hunter analyze <path>                    static analysis of PE / ELF / Mach-O binaries
+ioc-hunter analyze <path>                    static analysis of PE / ELF / Mach-O / PDF / OOXML / OLE / RTF
 ioc-hunter watch <path>                      tail a log file and alert on suspicious IOCs
 ioc-hunter correlate <path>                  shared-infra and shared-tag pivots
 ioc-hunter report <path> --format <fmt>      json | md | stix | misp | sigma | suricata
@@ -207,6 +199,8 @@ Add `--no-enrich` for an offline-only parse (no TI calls).
 ioc-hunter analyze ./sample.exe
 ```
 
+![ioc-hunter analyze evil.exe](docs/screenshots/analyze-pe.svg)
+
 A pure-Python static analyzer for **PE / ELF / Mach-O** — no `pefile`, no
 `lief`, no external services. One header, one verdict, then a finding
 list mapped to **MITRE ATT&CK** techniques.
@@ -242,18 +236,21 @@ Flags:
 
 ### Analyze a suspicious document
 
-`ioc-hunter analyze` also handles **PDF / OOXML / OLE** with the same
-single command. The dispatcher autodetects the format from magic bytes
-and routes to a dedicated parser — all pure Python, no `pdfminer`, no
-`olefile`, no `python-docx`.
+`ioc-hunter analyze` also handles **PDF / OOXML / OLE / RTF** with the
+same single command. The dispatcher autodetects the format from magic
+bytes and routes to a dedicated parser — all pure Python, no
+`pdfminer`, no `olefile`, no `python-docx`, no `oletools`.
 
 ```bash
 ioc-hunter analyze quarterly-report.pdf
 ioc-hunter analyze suspicious.docm
 ioc-hunter analyze legacy.doc
+ioc-hunter analyze invoice.rtf
 ```
 
 **PDF**:
+
+![ioc-hunter analyze evil.pdf](docs/screenshots/analyze-pdf.svg)
 
 - `xref` table + indirect-object walker; falls back to a regex scan
   on tampered xrefs (real malicious PDFs break them on purpose)
@@ -266,6 +263,8 @@ ioc-hunter analyze legacy.doc
   JavaScript bodies flow into the TI sweep
 
 **OOXML** (.docm / .xlsm / .pptm / docx / xlsx / pptx):
+
+![ioc-hunter analyze evil.docm](docs/screenshots/analyze-docm.svg)
 
 - ZIP walker via stdlib `zipfile`; subtype detection from
   `[Content_Types].xml`
@@ -282,9 +281,27 @@ ioc-hunter analyze legacy.doc
 - Full **MS-CFB parser**: 512-byte header, FAT chain with DiFAT
   extension, directory red-black-tree walker (UTF-16LE names),
   MiniFAT for streams under 4 KiB
+- Subtype detection: `.doc` (WordDocument stream), `.xls` (Workbook),
+  `.ppt` (PowerPoint Document), `.msi` (`!_StringPool` + `_Tables`),
+  bare `vbaProject.bin`
 - **`Equation Native` stream** detection → CVE-2017-11882 / CVE-2018-0802
 - Suspicious CLSIDs (Equation Editor, Packager)
 - `\x01Ole10Native` Packager-based file drops
+
+**RTF**:
+
+![ioc-hunter analyze evil.rtf](docs/screenshots/analyze-rtf.svg)
+
+- `\object` + `\objclass` walker recognises the exploit classes:
+  - **`Equation.3`** → CVE-2017-11882 (CRITICAL)
+  - **`Equation.2`** → CVE-2018-0802
+  - **`OLE2Link`** → CVE-2017-0199 (CRITICAL)
+  - **`Package`** → legacy file-launcher dropper
+- `\objupdate` / `\objautlink` → auto-fire trigger on document open
+- `\objdata` hex blob → decoded → if it's a CFB, we recurse with the
+  OLE analyzer and surface embedded `Equation Native` payloads as a
+  separate CRITICAL finding
+- `\objocx` ActiveX embedding, `\bin` raw-binary inclusion
 
 **VBA decompressor** ([MS-OVBA] §2.4.1):
 
@@ -465,7 +482,7 @@ Every push to `main` redeploys automatically. Health endpoint at
 | `exporters/` | JSON, Markdown, STIX 2.1, MISP Event |
 | `rules/` | Sigma + Suricata generators with severity floor |
 | `decoder/` | CyberChef-style operations + magic auto-detect |
-| `analyze/` | Static PE / ELF / Mach-O / PDF / OOXML / OLE analyzer + MS-OVBA decompressor + ATT&CK map |
+| `analyze/` | Static PE / ELF / Mach-O / PDF / OOXML / OLE / RTF analyzer + MS-OVBA decompressor + ATT&CK map |
 | `cli.py` | Rich-powered terminal UI |
 
 ---
@@ -510,8 +527,9 @@ All planned phases done.
 | 13 — FastAPI web demo + Render Blueprint | ✅ |
 | 14.1 — static PE / ELF / Mach-O analyzer + ATT&CK map | ✅ |
 | 14.2a — PDF / OOXML / OLE analyzer + MS-OVBA decompressor + Follina detection | ✅ |
+| 14.2b — RTF analyzer (Equation Editor, OLE2Link), OLE subtype detection, CLI polish | ✅ |
 
-**434 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
+**454 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
 Docker build, `ruff` lint + format check, and `gitleaks` secret scan on
 every push.
 

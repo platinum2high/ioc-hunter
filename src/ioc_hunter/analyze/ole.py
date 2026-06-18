@@ -216,6 +216,10 @@ def analyze_ole(raw: bytes, *, report: AnalyzerReport) -> AnalyzerReport:
         if e.obj_type != OBJ_EMPTY
     ]
 
+    subtype = _detect_ole_subtype(container)
+    if subtype:
+        report.metadata["ole_subtype"] = subtype
+
     _emit_ole_findings(container, report)
 
     # If the CFB carries VBA, hand off to the VBA module (imported lazily
@@ -513,6 +517,37 @@ def _read_stream_data(c: OleContainer, e: OleDirEntry) -> bytes:
 # ---------------------------------------------------------------------------
 # Heuristics + VBA-presence detection
 # ---------------------------------------------------------------------------
+
+
+def _detect_ole_subtype(c: OleContainer) -> str:
+    """Identify the well-known Office subtype from the CFB's stream set.
+
+    Returns ``"doc"`` / ``"xls"`` / ``"ppt"`` / ``"msi"`` /
+    ``"vba_project"`` when one of the canonical streams or root CLSIDs
+    matches; ``""`` otherwise. Useful for the CLI render and for
+    downstream tooling that wants to handle each Office family
+    differently.
+    """
+    streams = c.streams.keys()
+    # Legacy Office is identified by a single canonical stream name.
+    if any(n.endswith("WordDocument") or n == "WordDocument" for n in streams):
+        return "doc"
+    if any(n.endswith("Workbook") or n == "Workbook" or n == "Book" for n in streams):
+        return "xls"
+    if any(n.endswith("PowerPoint Document") for n in streams):
+        return "ppt"
+    # MSI installers carry !-prefixed metadata + table streams; Office
+    # also carries SummaryInformation but never the MSI-specific tables.
+    has_summary = any(
+        n.startswith("SummaryInformation") or n == "!SummaryInformation" for n in streams
+    )
+    has_msi_tables = any("!_StringPool" in n or "_Tables" in n for n in streams)
+    if has_summary and has_msi_tables:
+        return "msi"
+    # Bare vbaProject.bin: VBA storage but no WordDocument / Workbook stream.
+    if _looks_like_vba_project(c):
+        return "vba_project"
+    return ""
 
 
 def _looks_like_vba_project(c: OleContainer) -> bool:

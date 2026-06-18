@@ -83,6 +83,7 @@ class FileFormat(StrEnum):
     PDF = "pdf"
     OOXML = "ooxml"  # ZIP-based Office (.docx, .docm, .xlsm, .pptm, ...)
     OLE = "ole"  # Compound File Binary (.doc, .xls, .ppt, .msi, vbaProject.bin)
+    RTF = "rtf"  # Rich Text Format — usually carries OLE exploit objects
     UNKNOWN = "unknown"
 
 

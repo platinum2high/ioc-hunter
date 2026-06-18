@@ -29,6 +29,7 @@ from rich.table import Table
 from ioc_hunter import __version__
 from ioc_hunter.analyze import (
     AnalyzerReport,
+    FileFormat,
     Severity,
     analyze,
 )
@@ -424,16 +425,41 @@ def _entropy_bar(value: float, width: int = 10) -> str:
     return f"[{color}]{bar}[/]"
 
 
+_DOC_FORMATS = {FileFormat.PDF, FileFormat.OOXML, FileFormat.OLE, FileFormat.RTF}
+
+
 def _render_analyze_header(report: AnalyzerReport) -> None:
     label, style = _VERDICT_TEXT[report.verdict]
+    is_doc = report.format in _DOC_FORMATS
+
+    # ---- Format line. Binaries get Arch / Bits; docs get the parser-
+    # specific subtype where we know it.
+    format_line = f"[dim]Format:[/]  {report.format.value.upper()}"
+    if is_doc:
+        subtype = (
+            report.metadata.get("ooxml_subtype")
+            or report.metadata.get("ole_subtype")
+            or (f"v{report.metadata['pdf_version']}" if report.metadata.get("pdf_version") else "")
+        )
+        if subtype:
+            format_line += f"  [dim]Subtype:[/] {subtype}"
+    else:
+        format_line += (
+            f"  [dim]Arch:[/] {report.architecture or '—'}  [dim]Bits:[/] {report.bitness or '—'}"
+        )
+
+    # ---- Size + entropy + sections (sections hidden for docs).
+    size_line = (
+        f"[dim]Size:[/]    {report.file_size:,} bytes"
+        f"  [dim]Entropy:[/] {report.overall_entropy:.2f}"
+    )
+    if not is_doc:
+        size_line += f"  [dim]Sections:[/] {len(report.sections)}"
+
     lines = [
         f"[bold cyan]File:[/] {_escape_markup(report.path)}",
-        f"[dim]Format:[/]  {report.format.value.upper()}  "
-        f"[dim]Arch:[/] {report.architecture or '—'}  "
-        f"[dim]Bits:[/] {report.bitness or '—'}",
-        f"[dim]Size:[/]    {report.file_size:,} bytes  "
-        f"[dim]Entropy:[/] {report.overall_entropy:.2f}  "
-        f"[dim]Sections:[/] {len(report.sections)}",
+        format_line,
+        size_line,
         f"[dim]MD5:[/]     {report.md5}",
         f"[dim]SHA1:[/]    {report.sha1}",
         f"[dim]SHA256:[/]  {report.sha256}",
@@ -450,6 +476,25 @@ def _render_analyze_header(report: AnalyzerReport) -> None:
         lines.append(f"[dim]Signer:[/]  {_escape_markup(report.signer_cn)}")
     if report.issuer_cn:
         lines.append(f"[dim]Issuer:[/]  {_escape_markup(report.issuer_cn)}")
+
+    # ---- Doc-specific extras. Each line is conditional on something
+    # the parser actually populated, so clean PDFs stay clean.
+    if is_doc:
+        if report.metadata.get("pdf_objects_parsed"):
+            lines.append(f"[dim]Objects:[/] {report.metadata['pdf_objects_parsed']:,}")
+        if report.metadata.get("ooxml_entry_count"):
+            lines.append(
+                f"[dim]Entries:[/] {report.metadata['ooxml_entry_count']} [dim](ZIP members)[/]"
+            )
+        if report.metadata.get("ole_stream_count"):
+            lines.append(
+                f"[dim]Streams:[/] {report.metadata['ole_stream_count']} [dim](CFB streams)[/]"
+            )
+        if report.metadata.get("vba_module_count"):
+            lines.append(f"[dim]VBA modules:[/] {report.metadata['vba_module_count']}")
+        if report.metadata.get("rtf_objdata_blob_count"):
+            lines.append(f"[dim]\\objdata blobs:[/] {report.metadata['rtf_objdata_blob_count']}")
+
     flags = []
     if report.is_signed:
         flags.append("[green]signed[/]")
@@ -462,11 +507,14 @@ def _render_analyze_header(report: AnalyzerReport) -> None:
         flags.append(f"[yellow]overlay[/] ({report.overlay_size:,} bytes)")
     if flags:
         lines.append("[dim]Flags:[/]   " + ", ".join(flags))
+
     lines.append(
         f"\n[{style}]VERDICT: {label}[/]  "
         f"[dim]({len(report.findings)} finding(s), confidence {report.confidence():.0%})[/]"
     )
-    console.print(Panel.fit("\n".join(lines), title="Binary Analyzer", border_style=style))
+
+    title = "Document Analyzer" if is_doc else "Binary Analyzer"
+    console.print(Panel.fit("\n".join(lines), title=title, border_style=style))
 
 
 def _render_analyze_sections(report: AnalyzerReport) -> None:
