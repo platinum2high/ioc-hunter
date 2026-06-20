@@ -4,7 +4,7 @@ Commands:
     ioc-hunter check <ioc>            single-IOC lookup
     ioc-hunter scan-file <path>       extract + enrich every IOC in a file
     ioc-hunter parse-eml <path>       parse phishing .eml — headers, body, attachments
-    ioc-hunter analyze <path>         static analysis of PE / ELF / Mach-O binaries
+    ioc-hunter analyze <path>         static analysis of PE / ELF / Mach-O / PDF / DOC / PCAP
     ioc-hunter watch <path>           tail a log file and alert on suspicious IOCs
     ioc-hunter correlate <path>       find pivots across a batch of IOCs
     ioc-hunter report <path>          render JSON / Markdown / STIX / MISP / Sigma / Suricata
@@ -426,14 +426,18 @@ def _entropy_bar(value: float, width: int = 10) -> str:
 
 
 _DOC_FORMATS = {FileFormat.PDF, FileFormat.OOXML, FileFormat.OLE, FileFormat.RTF}
+_PCAP_FORMATS = {FileFormat.PCAP}
+_NON_BINARY_FORMATS = _DOC_FORMATS | _PCAP_FORMATS
 
 
 def _render_analyze_header(report: AnalyzerReport) -> None:
     label, style = _VERDICT_TEXT[report.verdict]
     is_doc = report.format in _DOC_FORMATS
+    is_pcap = report.format in _PCAP_FORMATS
+    is_non_binary = report.format in _NON_BINARY_FORMATS
 
     # ---- Format line. Binaries get Arch / Bits; docs get the parser-
-    # specific subtype where we know it.
+    # specific subtype where we know it; PCAPs get a capture-stats hint.
     format_line = f"[dim]Format:[/]  {report.format.value.upper()}"
     if is_doc:
         subtype = (
@@ -443,17 +447,25 @@ def _render_analyze_header(report: AnalyzerReport) -> None:
         )
         if subtype:
             format_line += f"  [dim]Subtype:[/] {subtype}"
+    elif is_pcap:
+        summary = report.metadata.get("pcap_summary", {})
+        if summary:
+            format_line += (
+                f"  [dim]Frames:[/] {summary.get('packets_dissected', 0):,}"
+                f"  [dim]Flows:[/] {summary.get('flows', 0):,}"
+                f"  [dim]Duration:[/] {summary.get('capture_duration_s', 0):.1f}s"
+            )
     else:
         format_line += (
             f"  [dim]Arch:[/] {report.architecture or '—'}  [dim]Bits:[/] {report.bitness or '—'}"
         )
 
-    # ---- Size + entropy + sections (sections hidden for docs).
+    # ---- Size + entropy + sections (sections hidden for docs/pcap).
     size_line = (
         f"[dim]Size:[/]    {report.file_size:,} bytes"
         f"  [dim]Entropy:[/] {report.overall_entropy:.2f}"
     )
-    if not is_doc:
+    if not is_non_binary:
         size_line += f"  [dim]Sections:[/] {len(report.sections)}"
 
     lines = [
@@ -513,7 +525,12 @@ def _render_analyze_header(report: AnalyzerReport) -> None:
         f"[dim]({len(report.findings)} finding(s), confidence {report.confidence():.0%})[/]"
     )
 
-    title = "Document Analyzer" if is_doc else "Binary Analyzer"
+    if is_pcap:
+        title = "Network Capture Analyzer"
+    elif is_doc:
+        title = "Document Analyzer"
+    else:
+        title = "Binary Analyzer"
     console.print(Panel.fit("\n".join(lines), title=title, border_style=style))
 
 
@@ -607,6 +624,105 @@ def _render_analyze_extras(report: AnalyzerReport) -> None:
                 border_style="magenta",
             )
         )
+
+
+def _render_analyze_pcap(report: AnalyzerReport) -> None:
+    """Render the PCAP-specific summary tables.
+
+    Renders five compact tables when ``pcap_summary`` is populated:
+    capture stats, top talkers, top destination ports, DNS aggregate,
+    and TLS JA3/SNI sample. Nothing renders for non-PCAP reports.
+    """
+    summary = report.metadata.get("pcap_summary")
+    if not summary:
+        return
+
+    # ---- Top talkers ------------------------------------------------------
+    talkers = summary.get("top_talkers") or []
+    if talkers:
+        table = Table(title="Top talkers (by bytes)", box=SIMPLE)
+        table.add_column("Endpoint", style="cyan", overflow="fold")
+        table.add_column("Packets", justify="right")
+        table.add_column("Payload bytes", justify="right")
+        for ip, pkts, byts in talkers:
+            table.add_row(ip, f"{pkts:,}", f"{byts:,}")
+        console.print(table)
+
+    # ---- Top destination ports -------------------------------------------
+    ports = summary.get("top_dst_ports") or []
+    if ports:
+        table = Table(title="Top destination ports", box=SIMPLE)
+        table.add_column("Port", justify="right", style="cyan")
+        table.add_column("Flows", justify="right")
+        table.add_column("Packets", justify="right")
+        for port, flows, pkts in ports:
+            table.add_row(str(port), f"{flows:,}", f"{pkts:,}")
+        console.print(table)
+
+    # ---- DNS aggregate ----------------------------------------------------
+    dns = summary.get("dns") or {}
+    if dns.get("queries") or dns.get("responses"):
+        qtype_counts = dns.get("qtype_counts") or {}
+        qtype_names = {
+            1: "A",
+            2: "NS",
+            5: "CNAME",
+            12: "PTR",
+            15: "MX",
+            16: "TXT",
+            28: "AAAA",
+            33: "SRV",
+            65: "HTTPS",
+        }
+        top_qtypes = sorted(qtype_counts.items(), key=lambda x: -x[1])[:6]
+        qtype_str = (
+            ", ".join(f"{qtype_names.get(qt, str(qt))}={count}" for qt, count in top_qtypes) or "—"
+        )
+        body = (
+            f"[dim]Queries:[/] {dns.get('queries', 0):,}     "
+            f"[dim]Responses:[/] {dns.get('responses', 0):,}     "
+            f"[dim]NXDOMAIN:[/] {dns.get('nxdomain', 0):,}\n"
+            f"[dim]Distinct names:[/] {dns.get('distinct_names', 0):,}     "
+            f"[dim]TXT response bytes:[/] {dns.get('txt_response_bytes', 0):,}\n"
+            f"[dim]Record types:[/] {qtype_str}"
+        )
+        console.print(Panel.fit(body, title="DNS", border_style="cyan"))
+
+    # ---- HTTP -------------------------------------------------------------
+    http = summary.get("http") or {}
+    if http.get("requests") or http.get("responses"):
+        hosts = http.get("hosts") or []
+        uas = http.get("user_agents") or []
+        body_lines = [
+            f"[dim]Requests:[/] {http.get('requests', 0):,}     "
+            f"[dim]Responses:[/] {http.get('responses', 0):,}"
+        ]
+        if hosts:
+            shown = ", ".join(hosts[:6])
+            extra = f", +{len(hosts) - 6}" if len(hosts) > 6 else ""
+            body_lines.append(f"[dim]Hosts:[/] {_escape_markup(shown + extra)}")
+        if uas:
+            shown = ", ".join(uas[:4])
+            extra = f", +{len(uas) - 4}" if len(uas) > 4 else ""
+            body_lines.append(f"[dim]User-Agents:[/] {_escape_markup(shown + extra)}")
+        console.print(Panel.fit("\n".join(body_lines), title="HTTP", border_style="cyan"))
+
+    # ---- TLS / JA3 --------------------------------------------------------
+    tls = summary.get("tls") or {}
+    if tls.get("client_hellos"):
+        snis = tls.get("snis") or []
+        ja3 = tls.get("ja3_sample") or []
+        body_lines = [
+            f"[dim]ClientHellos:[/] {tls.get('client_hellos', 0):,}     "
+            f"[dim]Distinct JA3:[/] {tls.get('distinct_ja3', 0)}"
+        ]
+        if snis:
+            shown = ", ".join(snis[:8])
+            extra = f", +{len(snis) - 8}" if len(snis) > 8 else ""
+            body_lines.append(f"[dim]SNIs:[/] {_escape_markup(shown + extra)}")
+        if ja3:
+            body_lines.append("[dim]JA3:[/] " + ", ".join(ja3[:6]))
+        console.print(Panel.fit("\n".join(body_lines), title="TLS", border_style="cyan"))
 
 
 def _render_analyze_iocs(report: AnalyzerReport) -> None:
@@ -734,6 +850,7 @@ async def _run_analyze(
     _render_analyze_extras(report)
     _render_analyze_sections(report)
     _render_analyze_imports(report)
+    _render_analyze_pcap(report)
     _render_analyze_findings(report)
     _render_analyze_iocs(report)
 
@@ -785,7 +902,10 @@ async def _enrich_for_json(iocs, *, use_cache: bool):
 
 @app.command(
     name="analyze",
-    help="Deep static analysis of a PE / ELF / Mach-O binary.",
+    help=(
+        "Deep static analysis of a binary (PE / ELF / Mach-O), document "
+        "(PDF / OOXML / OLE / RTF), or network capture (PCAP / PCAPNG)."
+    ),
 )
 def analyze_cmd(
     path: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, resolve_path=True),

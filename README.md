@@ -58,6 +58,7 @@ they don't crash, just gracefully skip.
 | Cache | none | SQLite with TTL — survives across runs, doesn't burn API quota |
 | Binary forensics | none | static PE / ELF / Mach-O analyzer: ImpHash, Authenticode, entitlements, embedded payloads, ATT&CK techniques |
 | Document forensics | none | PDF / OOXML / OLE / RTF analyzer: PDF actions, MS-OVBA decompressor, Follina/template-injection, Equation Editor (CVE-2017-11882), OLE2Link (CVE-2017-0199), embedded payload extraction |
+| Network forensics | tcpdump-only | PCAP / PCAPNG analyzer: 5-tuple flows + top-talkers, DNS dissection, HTTP plaintext, **TLS ClientHello + JA3 fingerprint**, beaconing detection, DGA-shape DNS, DNS-tunneling, port scans, one-sided exfil, plaintext-credential leaks, ICMP tunnel |
 
 ---
 
@@ -134,7 +135,7 @@ mounted as a volume so it survives across containers.
 ioc-hunter check <ioc>                       single IOC verdict
 ioc-hunter scan-file <path>                  extract + enrich every IOC in a file
 ioc-hunter parse-eml <path>                  phishing .eml — headers, body, attachments
-ioc-hunter analyze <path>                    static analysis of PE / ELF / Mach-O / PDF / OOXML / OLE / RTF
+ioc-hunter analyze <path>                    static analysis of PE / ELF / Mach-O / PDF / OOXML / OLE / RTF / PCAP / PCAPNG
 ioc-hunter watch <path>                      tail a log file and alert on suspicious IOCs
 ioc-hunter correlate <path>                  shared-infra and shared-tag pivots
 ioc-hunter report <path> --format <fmt>      json | md | stix | misp | sigma | suricata
@@ -325,6 +326,105 @@ Every doc finding is mapped to MITRE ATT&CK by the same tagger used
 for binaries — `analyze --json` and `--md` both render the techniques
 inline.
 
+### Analyze a packet capture
+
+`ioc-hunter analyze` also handles **PCAP** and **PCAPNG**. Same one
+command, autodetected from magic bytes, routed to a hand-rolled parser
+— pure Python, no `scapy`, no `dpkt`, no `pyshark`, no `tshark`.
+
+```bash
+ioc-hunter analyze suspicious-traffic.pcap
+ioc-hunter analyze hunt-sample.pcapng
+```
+
+![ioc-hunter analyze evil.pcap](docs/screenshots/analyze-pcap.svg)
+
+**Container + L2-L4 dissection**
+
+- libpcap classic (microsecond *and* nanosecond timestamps, both
+  endiannesses) and PCAPNG (Section Header / Interface Description /
+  Enhanced + Simple Packet Block walker — unknown block types are
+  skipped via `block_total_length`, so we keep going on captures other
+  tools choke on)
+- Ethernet II, **802.1Q VLAN** (one nesting) + QinQ, Linux SLL v1/v2,
+  BSD NULL/LOOP, RAW IP
+- IPv4 with IHL-correct options skip, **IPv6 with extension-header
+  chain walked** to the transport
+- TCP / UDP / ICMP / ICMPv6 — every offset bounds-checked, malformed
+  records yield a degraded report rather than a stack trace
+
+**Flow aggregation**
+
+- Bidirectional 5-tuple flows with per-direction packet and **payload-
+  byte** counters, top-talkers, top destination ports
+- The initiator is whichever side sent the first SYN (or the first
+  packet if there is no SYN) — so `a_ip → b_ip` always reads from
+  client to server
+
+**Application layer**
+
+- **DNS** — UDP/53 + TCP/53 (length-prefixed). QNAME decoder with
+  pointer-loop protection (hop cap, total-length cap). Per-name
+  aggregation tracks query count, NXDOMAIN count, TXT response bytes —
+  the inputs the heuristics layer reads
+- **HTTP plaintext** — opportunistic per-direction stream stitching
+  (capped, never full TCP reassembly — that's a bigger project) so
+  headers spanning multiple segments still parse. Extracts Method /
+  Host / URI / User-Agent / Server / Status. Flags HTTP **Basic-auth
+  headers** in cleartext as a credential leak. Known-malicious UA
+  patterns (Emotet `Mozilla/4.0`, Sliver, BITSAdmin, empty UAs, …)
+  raise their own finding
+- **TLS ClientHello** — record-layer + handshake walker for the first
+  ClientHello per direction. Extracts SNI, advertised cipher list,
+  extensions, supported groups, EC point formats, ALPN. Computes the
+  **JA3 fingerprint** per the published spec — GREASE values stripped,
+  hex MD5 over `SSLVersion,Cipher,Extension,EllipticCurve,EllipticCurvePointFormat`
+
+**Behavioural heuristics** — the part that catches *brand-new* implants
+where static IOCs don't
+
+- **Beaconing** — periodic client→server intervals scored on the
+  coefficient of variation (stddev / mean). Cobalt Strike defaults sit
+  around 0.1–0.2; benign keepalives drift past 0.4. Surfaces flow,
+  mean interval, packet count
+- **DGA-shaped DNS** — entropy + consonant-cluster check on the 2LD
+  label, with a known-compound-TLD table so `ministry.gov.uk` correctly
+  resolves to `ministry`, not `gov`. Single hits log INFO; ≥3 in one
+  capture fire HIGH
+- **DNS tunneling** — aggregate TXT-response volume + per-2LD query
+  rate; both signals separately flagged, the combo flips the verdict
+- **NXDOMAIN ratio ≥50%** of responses — classic DGA churn, fires
+  MEDIUM
+- **Port scan** (one src → one dst, many ports) and **host sweep**
+  (one src → many dst, one port), keyed off TCP SYN-without-ACK so
+  server-side SYN+ACK responses don't trigger false positives
+- **One-sided exfil** — ≥256 KiB a→b with reverse traffic under 5% of
+  outbound. Classic HTTP POST / unauth upload tell
+- **ICMP tunnel** — large ICMP-echo payloads (≥64 B past the header)
+  sustained over ≥20 packets per (src, dst). Real ping isn't this
+  noisy
+- **Plaintext FTP USER/PASS** + **HTTP Basic-auth** — every credential
+  on the wire surfaces as its own HIGH finding
+
+**MITRE ATT&CK mapping**
+
+| Rule | Technique |
+| --- | --- |
+| `pcap.beaconing` | T1071.001, T1573, T1029 |
+| `pcap.dga_dns` / `pcap.high_nxdomain_ratio` | T1568.002 |
+| `pcap.dns_tunneling_*` | T1071.004, T1572 |
+| `pcap.port_scan` | T1046 |
+| `pcap.host_sweep` | T1018 |
+| `pcap.unidirectional_exfil` | T1041, T1567 |
+| `pcap.icmp_tunnel` | T1095, T1572 |
+| `pcap.plaintext_*` | T1040 |
+
+Every PCAP finding flows through the same renderer as PE / PDF / RTF
+findings; `--json` / `--md` carry the same fields. The dispatcher also
+runs the global IOC sweep over the strings + extracted SNIs + DNS
+names, so `analyze sample.pcap --no-enrich` already gives the analyst
+the URL, domain, and IPv4 list with zero extra flags.
+
 ### Watch a log file live
 
 ```bash
@@ -482,7 +582,7 @@ Every push to `main` redeploys automatically. Health endpoint at
 | `exporters/` | JSON, Markdown, STIX 2.1, MISP Event |
 | `rules/` | Sigma + Suricata generators with severity floor |
 | `decoder/` | CyberChef-style operations + magic auto-detect |
-| `analyze/` | Static PE / ELF / Mach-O / PDF / OOXML / OLE / RTF analyzer + MS-OVBA decompressor + ATT&CK map |
+| `analyze/` | Static PE / ELF / Mach-O / PDF / OOXML / OLE / RTF / PCAP / PCAPNG analyzer + MS-OVBA decompressor + JA3 fingerprinting + ATT&CK map |
 | `cli.py` | Rich-powered terminal UI |
 
 ---
@@ -528,8 +628,9 @@ All planned phases done.
 | 14.1 — static PE / ELF / Mach-O analyzer + ATT&CK map | ✅ |
 | 14.2a — PDF / OOXML / OLE analyzer + MS-OVBA decompressor + Follina detection | ✅ |
 | 14.2b — RTF analyzer (Equation Editor, OLE2Link), OLE subtype detection, CLI polish | ✅ |
+| 14.3a — PCAP / PCAPNG analyzer (flows, DNS/HTTP/TLS+JA3, beaconing, DGA, exfil, plaintext-creds) | ✅ |
 
-**454 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
+**521 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
 Docker build, `ruff` lint + format check, and `gitleaks` secret scan on
 every push.
 

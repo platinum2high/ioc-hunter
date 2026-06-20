@@ -125,6 +125,20 @@ _MAP: dict[str, tuple[str, ...]] = {
     "rtf.raw_binary_blob": ("T1027",),
     "rtf.embedded_cfb": ("T1027.009", "T1203"),
     "rtf.equation_native_payload": ("T1203", "T1566.001"),
+    # ---- PCAP analyzer (phase 14.3a) ---------------------------------------
+    "pcap.beaconing": ("T1071.001", "T1573", "T1029"),  # App-layer C2 + scheduled
+    "pcap.port_scan": ("T1046",),  # Network Service Scanning
+    "pcap.host_sweep": ("T1018",),  # Remote System Discovery
+    "pcap.unidirectional_exfil": ("T1041", "T1567"),  # Exfil over C2 / Web Service
+    "pcap.dga_dns": ("T1568.002",),  # Domain Generation Algorithms
+    "pcap.dga_dns_outlier": ("T1568.002",),
+    "pcap.dns_tunneling_txt_volume": ("T1071.004", "T1572"),  # DNS / Protocol Tunnel
+    "pcap.dns_tunneling_query_rate": ("T1071.004", "T1572"),
+    "pcap.high_nxdomain_ratio": ("T1568.002",),
+    "pcap.plaintext_ftp_creds": ("T1040",),  # Network Sniffing (exposed creds)
+    "pcap.plaintext_http_basic": ("T1040",),
+    "pcap.icmp_tunnel": ("T1095", "T1572"),  # Non-App-Layer C2
+    "pcap.suspicious_user_agent": ("T1071.001",),
 }
 
 

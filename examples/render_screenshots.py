@@ -507,7 +507,81 @@ def render_analyze(console: Console, sample_path: Path) -> None:
     cli._render_analyze_header(report)
     cli._render_analyze_sections(report)
     cli._render_analyze_imports(report)
+    cli._render_analyze_pcap(report)
     cli._render_analyze_findings(report)
+    cli._render_analyze_iocs(report)
+
+
+def _build_evil_pcap(path: Path) -> None:
+    """Synthetic capture: beacon + DGA + plaintext FTP creds + TLS ClientHello
+    + an HTTP GET — five separate signals so the panel shows everything."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tests"))
+    from _pcap_fixtures import (  # type: ignore[import-not-found]
+        build_pcap,
+        dns_query,
+        dns_response,
+        eth_ipv4_tcp,
+        eth_ipv4_udp,
+        http_request,
+        synth_tls_clienthello,
+    )
+
+    frames: list = []
+    # Beacon: 12 connections at a tight 60s cadence
+    for i in range(12):
+        frames.append(
+            (
+                100.0 + 60.0 * i + 0.02 * (i % 3),
+                eth_ipv4_tcp("10.0.0.5", "203.0.113.10", 51000, 443, payload=b"X" * 16),
+            )
+        )
+    # DGA-shaped DNS lookups
+    for i, name in enumerate(
+        [
+            "vqxznmkpfhg.com",
+            "rzxvbnmwerty.net",
+            "kjhwbcxpvnzm.org",
+            "btxkcnxrtgmd.io",
+        ]
+    ):
+        frames.append(
+            (10.0 + i, eth_ipv4_udp("10.0.0.5", "8.8.8.8", 50000 + i, 53, dns_query(name)))
+        )
+        frames.append(
+            (
+                10.0 + i + 0.05,
+                eth_ipv4_udp("8.8.8.8", "10.0.0.5", 53, 50000 + i, dns_response(name)),
+            )
+        )
+    # Real HTTP GET — surfaces Host + UA + URL via the IOC sweep
+    frames.append(
+        (
+            20.0,
+            eth_ipv4_tcp(
+                "10.0.0.5",
+                "203.0.113.20",
+                52000,
+                80,
+                payload=http_request("GET", "track.attacker.tld", "/c2/checkin?id=abc"),
+            ),
+        )
+    )
+    # Plaintext FTP credentials
+    frames.append(
+        (
+            30.0,
+            eth_ipv4_tcp("10.0.0.5", "203.0.113.30", 53000, 21, payload=b"USER backup_admin\r\n"),
+        )
+    )
+    frames.append(
+        (30.1, eth_ipv4_tcp("10.0.0.5", "203.0.113.30", 53000, 21, payload=b"PASS hunter2\r\n"))
+    )
+    # TLS ClientHello with SNI → JA3 fingerprint surfaces
+    ch = synth_tls_clienthello(sni="api.attacker.tld")
+    frames.append((40.0, eth_ipv4_tcp("10.0.0.5", "203.0.113.40", 54000, 443, payload=ch)))
+    path.write_bytes(build_pcap(frames))
 
 
 if __name__ == "__main__":
@@ -528,13 +602,16 @@ if __name__ == "__main__":
         pdf_path = Path(tmp) / "evil.pdf"
         docm_path = Path(tmp) / "evil.docm"
         rtf_path = Path(tmp) / "evil.rtf"
+        pcap_path = Path(tmp) / "evil.pcap"
         _analyze_evil_pe(pe_path)
         _build_evil_pdf(pdf_path)
         _build_evil_docm(docm_path)
         _build_evil_rtf(rtf_path)
+        _build_evil_pcap(pcap_path)
         _record("analyze-pe", lambda c, p=pe_path: render_analyze(c, p))
         _record("analyze-pdf", lambda c, p=pdf_path: render_analyze(c, p))
         _record("analyze-docm", lambda c, p=docm_path: render_analyze(c, p))
         _record("analyze-rtf", lambda c, p=rtf_path: render_analyze(c, p))
+        _record("analyze-pcap", lambda c, p=pcap_path: render_analyze(c, p))
 
     print(f"\nDone — {OUTPUT_DIR}")

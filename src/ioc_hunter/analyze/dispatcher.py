@@ -47,6 +47,8 @@ from ioc_hunter.analyze.macho import (
 )
 from ioc_hunter.analyze.ole import CFB_SIGNATURE, analyze_ole
 from ioc_hunter.analyze.ooxml import analyze_ooxml, is_ooxml
+from ioc_hunter.analyze.pcap import analyze_pcap
+from ioc_hunter.analyze.pcap_parse import detect_pcap_format
 from ioc_hunter.analyze.pdf import analyze_pdf
 from ioc_hunter.analyze.pe import analyze_pe
 from ioc_hunter.analyze.rtf import analyze_rtf, is_rtf
@@ -74,6 +76,8 @@ def detect_format(head: bytes) -> FileFormat:
         return FileFormat.OOXML
     if is_rtf(head):
         return FileFormat.RTF
+    if detect_pcap_format(head):
+        return FileFormat.PCAP
     magic = int.from_bytes(head[:4], "little")
     if magic in (MH_MAGIC, MH_MAGIC_64, MH_CIGAM, MH_CIGAM_64):
         return FileFormat.MACHO
@@ -165,6 +169,8 @@ def analyze(path: str | Path, *, want_strings: bool = True) -> AnalyzerReport:
         analyze_ole(raw, report=report)
     elif fmt == FileFormat.RTF:
         analyze_rtf(raw, report=report)
+    elif fmt == FileFormat.PCAP:
+        analyze_pcap(raw, report=report)
     elif fmt == FileFormat.MACHO:
         analyze_macho(raw, report=report, slice_offset=0)
     elif fmt == FileFormat.MACHO_FAT:
