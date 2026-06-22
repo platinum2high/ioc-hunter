@@ -508,6 +508,7 @@ def render_analyze(console: Console, sample_path: Path) -> None:
     cli._render_analyze_sections(report)
     cli._render_analyze_imports(report)
     cli._render_analyze_pcap(report)
+    cli._render_analyze_archive(report)
     cli._render_analyze_findings(report)
     cli._render_analyze_iocs(report)
 
@@ -525,7 +526,14 @@ def _build_evil_pcap(path: Path) -> None:
         eth_ipv4_tcp,
         eth_ipv4_udp,
         http_request,
+        krb_tcp,
+        krb_tgs_rep,
+        ntlm_authenticate,
+        ntlm_challenge,
+        smb2_session_setup,
+        smb2_tree_connect,
         synth_tls_clienthello,
+        synth_tls_serverhello,
     )
 
     frames: list = []
@@ -578,10 +586,87 @@ def _build_evil_pcap(path: Path) -> None:
     frames.append(
         (30.1, eth_ipv4_tcp("10.0.0.5", "203.0.113.30", 53000, 21, payload=b"PASS hunter2\r\n"))
     )
-    # TLS ClientHello with SNI → JA3 fingerprint surfaces
+    # TLS ClientHello with SNI → JA3, plus the ServerHello → JA3S
     ch = synth_tls_clienthello(sni="api.attacker.tld")
     frames.append((40.0, eth_ipv4_tcp("10.0.0.5", "203.0.113.40", 54000, 443, payload=ch)))
+    sh = synth_tls_serverhello()
+    frames.append((40.1, eth_ipv4_tcp("203.0.113.40", "10.0.0.5", 443, 54000, payload=sh)))
+    # SMB lateral movement: TREE_CONNECT to an admin share
+    frames.append(
+        (
+            50.0,
+            eth_ipv4_tcp(
+                "10.0.0.5", "10.0.0.20", 55000, 445, payload=smb2_tree_connect(r"\\FILES01\ADMIN$")
+            ),
+        )
+    )
+    # NTLM authentication captured in the clear → NetNTLMv2 hash
+    frames.append(
+        (
+            50.1,
+            eth_ipv4_tcp(
+                "10.0.0.20", "10.0.0.5", 445, 55001, payload=smb2_session_setup(ntlm_challenge())
+            ),
+        )
+    )
+    frames.append(
+        (
+            50.2,
+            eth_ipv4_tcp(
+                "10.0.0.5",
+                "10.0.0.20",
+                55001,
+                445,
+                payload=smb2_session_setup(ntlm_authenticate("CORP", "svc_backup", "WKS31")),
+            ),
+        )
+    )
+    # Kerberoasting: TGS-REP issuing an RC4 service ticket
+    frames.append(
+        (
+            60.0,
+            eth_ipv4_tcp(
+                "10.0.0.20", "10.0.0.5", 88, 56000, payload=krb_tcp(krb_tgs_rep(ticket_etype=23))
+            ),
+        )
+    )
     path.write_bytes(build_pcap(frames))
+
+
+def _build_evil_archive(path: Path) -> None:
+    """A phishing-style zip: an executable payload, a benign decoy, and a
+    nested zip hiding a capture that screams lateral movement."""
+    import io
+    import sys
+    import zipfile
+
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tests"))
+    from _pcap_fixtures import (  # type: ignore[import-not-found]
+        build_pcap,
+        eth_ipv4_tcp,
+        smb2_tree_connect,
+    )
+
+    mal_pcap = build_pcap(
+        [
+            (
+                1.0,
+                eth_ipv4_tcp(
+                    "10.0.0.5", "10.0.0.20", 50000, 445, payload=smb2_tree_connect(r"\\DC01\ADMIN$")
+                ),
+            )
+        ]
+    )
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("incident_capture.pcap", mal_pcap)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("Invoice_2026.pdf.js", b"var s = new ActiveXObject('WScript.Shell'); // dropper")
+        z.writestr("readme.txt", b"Please enable content. Contact http://payment-portal.tld/login")
+        z.writestr("evidence.zip", inner.getvalue())
+    path.write_bytes(buf.getvalue())
 
 
 if __name__ == "__main__":
@@ -603,15 +688,18 @@ if __name__ == "__main__":
         docm_path = Path(tmp) / "evil.docm"
         rtf_path = Path(tmp) / "evil.rtf"
         pcap_path = Path(tmp) / "evil.pcap"
+        archive_path = Path(tmp) / "evil.zip"
         _analyze_evil_pe(pe_path)
         _build_evil_pdf(pdf_path)
         _build_evil_docm(docm_path)
         _build_evil_rtf(rtf_path)
         _build_evil_pcap(pcap_path)
+        _build_evil_archive(archive_path)
         _record("analyze-pe", lambda c, p=pe_path: render_analyze(c, p))
         _record("analyze-pdf", lambda c, p=pdf_path: render_analyze(c, p))
         _record("analyze-docm", lambda c, p=docm_path: render_analyze(c, p))
         _record("analyze-rtf", lambda c, p=rtf_path: render_analyze(c, p))
         _record("analyze-pcap", lambda c, p=pcap_path: render_analyze(c, p))
+        _record("analyze-archive", lambda c, p=archive_path: render_analyze(c, p))
 
     print(f"\nDone — {OUTPUT_DIR}")

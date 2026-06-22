@@ -58,7 +58,8 @@ they don't crash, just gracefully skip.
 | Cache | none | SQLite with TTL — survives across runs, doesn't burn API quota |
 | Binary forensics | none | static PE / ELF / Mach-O analyzer: ImpHash, Authenticode, entitlements, embedded payloads, ATT&CK techniques |
 | Document forensics | none | PDF / OOXML / OLE / RTF analyzer: PDF actions, MS-OVBA decompressor, Follina/template-injection, Equation Editor (CVE-2017-11882), OLE2Link (CVE-2017-0199), embedded payload extraction |
-| Network forensics | tcpdump-only | PCAP / PCAPNG analyzer: 5-tuple flows + top-talkers, DNS dissection, HTTP plaintext, **TLS ClientHello + JA3 fingerprint**, beaconing detection, DGA-shape DNS, DNS-tunneling, port scans, one-sided exfil, plaintext-credential leaks, ICMP tunnel |
+| Network forensics | tcpdump-only | PCAP / PCAPNG analyzer: 5-tuple flows + top-talkers, DNS dissection, HTTP plaintext, **TLS ClientHello/ServerHello + JA3/JA3S fingerprints**, **SMB lateral movement + NetNTLMv2 capture**, **Kerberoasting / AS-REP roasting**, beaconing detection, DGA-shape DNS, DNS-tunneling, port scans, one-sided exfil, plaintext-credential leaks, ICMP tunnel |
+| Archive triage | unzip + re-scan by hand | **Recursive** ZIP / TAR / GZIP / BZIP2 / XZ analyzer — every member re-dispatched through the engine, child IOCs merged, zip-bomb / depth / encryption defences, phishing-cargo detection |
 
 ---
 
@@ -135,7 +136,7 @@ mounted as a volume so it survives across containers.
 ioc-hunter check <ioc>                       single IOC verdict
 ioc-hunter scan-file <path>                  extract + enrich every IOC in a file
 ioc-hunter parse-eml <path>                  phishing .eml — headers, body, attachments
-ioc-hunter analyze <path>                    static analysis of PE / ELF / Mach-O / PDF / OOXML / OLE / RTF / PCAP / PCAPNG
+ioc-hunter analyze <path>                    static analysis of PE / ELF / Mach-O / PDF / OOXML / OLE / RTF / PCAP / PCAPNG / ZIP-TAR-GZIP archives
 ioc-hunter watch <path>                      tail a log file and alert on suspicious IOCs
 ioc-hunter correlate <path>                  shared-infra and shared-tag pivots
 ioc-hunter report <path> --format <fmt>      json | md | stix | misp | sigma | suricata
@@ -374,11 +375,36 @@ ioc-hunter analyze hunt-sample.pcapng
   headers** in cleartext as a credential leak. Known-malicious UA
   patterns (Emotet `Mozilla/4.0`, Sliver, BITSAdmin, empty UAs, …)
   raise their own finding
-- **TLS ClientHello** — record-layer + handshake walker for the first
-  ClientHello per direction. Extracts SNI, advertised cipher list,
+- **TLS ClientHello + JA3** — record-layer + handshake walker for the
+  first ClientHello per direction. Extracts SNI, advertised cipher list,
   extensions, supported groups, EC point formats, ALPN. Computes the
   **JA3 fingerprint** per the published spec — GREASE values stripped,
   hex MD5 over `SSLVersion,Cipher,Extension,EllipticCurve,EllipticCurvePointFormat`
+- **TLS ServerHello + JA3S** — the server-side companion fingerprint
+  (`SSLVersion,Cipher,Extension`, single selected cipher). Pairing a
+  flow's JA3 with its JA3S fingerprints the *server implementation* — the
+  single strongest tell that a benign-looking 443 flow is actually a C2
+  teamserver. Both are checked against a small known-bad table (Cobalt
+  Strike / Metasploit default profiles)
+
+**Lateral movement & authentication** — the "attacker is already inside"
+phase, dissected straight off the wire
+
+- **SMB** (TCP/445, or TCP/139 behind a NetBIOS session header) —
+  identifies the dialect (SMB1 vs SMB2/3), pulls the **TREE_CONNECT** UNC
+  path, and flags administrative-share access (`\\host\ADMIN$`, drive
+  shares) as the PsExec/wmiexec lateral-movement tell. Legacy **SMB1**
+  raises its own finding (the MS17-010 / EternalBlue transport)
+- **NTLM capture** — parses the **NTLMSSP** messages inside SMB
+  SESSION_SETUP and pairs a CHALLENGE (type 2) with its AUTHENTICATE
+  (type 3) on the same flow to reconstruct a **NetNTLMv2** hash in
+  hashcat `-m 5600` format — a crackable credential handed straight to
+  the IR team
+- **Kerberos** (TCP/88 length-prefixed, or UDP/88) — a bounded,
+  stdlib-only **ASN.1/DER walker** pulls message type, realm, client and
+  service principals, and requested encryption types, then flags
+  **Kerberoasting** (RC4-HMAC service ticket), **AS-REP roasting**
+  (AS-REQ with no pre-authentication), and **RC4 encryption downgrade**
 
 **Behavioural heuristics** — the part that catches *brand-new* implants
 where static IOCs don't
@@ -405,6 +431,8 @@ where static IOCs don't
   noisy
 - **Plaintext FTP USER/PASS** + **HTTP Basic-auth** — every credential
   on the wire surfaces as its own HIGH finding
+- **TLS anomalies** — ClientHello to a **non-standard port** (C2 hiding
+  from port filters) and **no-SNI on 443** (direct-IP-pinned implant)
 
 **MITRE ATT&CK mapping**
 
@@ -418,12 +446,49 @@ where static IOCs don't
 | `pcap.unidirectional_exfil` | T1041, T1567 |
 | `pcap.icmp_tunnel` | T1095, T1572 |
 | `pcap.plaintext_*` | T1040 |
+| `pcap.ja3_known_bad` / `pcap.ja3s_known_bad` | T1071.001, T1573.001 |
+| `pcap.tls_non_standard_port` | T1571 |
+| `pcap.smb_admin_share` | T1021.002, T1570 |
+| `pcap.smb1_in_use` | T1210 |
+| `pcap.netntlmv2_capture` | T1040, T1557.001 |
+| `pcap.kerberoasting` | T1558.003 |
+| `pcap.asrep_roasting` | T1558.004 |
 
 Every PCAP finding flows through the same renderer as PE / PDF / RTF
 findings; `--json` / `--md` carry the same fields. The dispatcher also
 runs the global IOC sweep over the strings + extracted SNIs + DNS
 names, so `analyze sample.pcap --no-enrich` already gives the analyst
 the URL, domain, and IPv4 list with zero extra flags.
+
+### Analyze an archive (recursive)
+
+Malware rarely arrives bare — it arrives zipped, often nested and
+password-protected to slip past gateway AV. `ioc-hunter analyze` unpacks
+the common container families (**ZIP / TAR / GZIP / BZIP2 / XZ**, plus
+`.tar.gz` and friends) **stdlib-only** and re-dispatches every member
+back through the analyzer, so a PE buried three layers down still gets
+its imports walked and its IOCs swept.
+
+```bash
+ioc-hunter analyze phishing-attachment.zip
+```
+
+![ioc-hunter analyze evil.zip](docs/screenshots/analyze-archive.svg)
+
+- **Recursive** — each member is analysed in full (PE/PDF/PCAP/…); a
+  malicious member escalates the archive's verdict, and its IOCs are
+  merged into the parent report
+- **Real OOXML vs plain ZIP** — a `.docx`/`.xlsm` (PK container with the
+  `[Content_Types].xml` skeleton) still routes to the document analyzer;
+  everything else (plain ZIP, JAR, APK, ODF) goes to the recursive scan
+- **Zip-bomb defences** — a depth cap, a shared uncompressed-byte budget
+  across the whole recursion, and a per-member compression-ratio check
+  (a member that expands 200:1 over 8 MiB is reported and skipped, never
+  inflated)
+- **Delivery / evasion tells** — password-protected members
+  (`archive.encrypted_member`) and executable/script cargo
+  (`invoice.pdf.js`, `setup.exe` → `archive.executable_payload`) raise
+  their own findings — the classic phishing-attachment shape
 
 ### Watch a log file live
 
@@ -582,7 +647,7 @@ Every push to `main` redeploys automatically. Health endpoint at
 | `exporters/` | JSON, Markdown, STIX 2.1, MISP Event |
 | `rules/` | Sigma + Suricata generators with severity floor |
 | `decoder/` | CyberChef-style operations + magic auto-detect |
-| `analyze/` | Static PE / ELF / Mach-O / PDF / OOXML / OLE / RTF / PCAP / PCAPNG analyzer + MS-OVBA decompressor + JA3 fingerprinting + ATT&CK map |
+| `analyze/` | Static PE / ELF / Mach-O / PDF / OOXML / OLE / RTF / PCAP / PCAPNG + recursive archive analyzer + MS-OVBA decompressor + JA3/JA3S fingerprinting + SMB/NTLM/Kerberos dissection + ATT&CK map |
 | `cli.py` | Rich-powered terminal UI |
 
 ---
@@ -629,8 +694,9 @@ All planned phases done.
 | 14.2a — PDF / OOXML / OLE analyzer + MS-OVBA decompressor + Follina detection | ✅ |
 | 14.2b — RTF analyzer (Equation Editor, OLE2Link), OLE subtype detection, CLI polish | ✅ |
 | 14.3a — PCAP / PCAPNG analyzer (flows, DNS/HTTP/TLS+JA3, beaconing, DGA, exfil, plaintext-creds) | ✅ |
+| 14.3b — JA3S + SMB/NTLM (NetNTLMv2 capture) + Kerberos (Kerberoast / AS-REP roast) + TLS anomalies + **recursive archive scan** | ✅ |
 
-**521 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
+**570 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
 Docker build, `ruff` lint + format check, and `gitleaks` secret scan on
 every push.
 

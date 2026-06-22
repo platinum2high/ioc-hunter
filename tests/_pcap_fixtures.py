@@ -331,3 +331,242 @@ def synth_tls_clienthello(
     hs = b"\x01" + struct.pack(">I", len(body))[1:] + body  # handshake type 0x01 + 3-byte length
     record = b"\x16" + struct.pack(">H", 0x0301) + struct.pack(">H", len(hs)) + hs
     return record
+
+
+def synth_tls_serverhello(
+    *,
+    version: int = 0x0303,
+    cipher: int = 0xC02F,
+    extensions_order: tuple[int, ...] = (0x0000, 0x000B, 0xFF01),
+) -> bytes:
+    """Build a TLS record carrying one ServerHello with the given parameters.
+
+    The server selects a single cipher (unlike the client's list), so JA3S
+    keys on (version, cipher, extension-list). Extension bodies are empty —
+    JA3S only fingerprints the extension *types*, in order.
+    """
+    extensions = bytearray()
+    for et in extensions_order:
+        extensions.extend(struct.pack(">HH", et, 0))  # type + zero-length body
+    ext_total = struct.pack(">H", len(extensions)) + bytes(extensions)
+    body = (
+        struct.pack(">H", version)
+        + b"\x11" * 32  # server_random
+        + b"\x00"  # session_id len
+        + struct.pack(">H", cipher)
+        + b"\x00"  # compression method (single byte)
+        + ext_total
+    )
+    hs = b"\x02" + struct.pack(">I", len(body))[1:] + body  # handshake type 0x02 ServerHello
+    return b"\x16" + struct.pack(">H", 0x0303) + struct.pack(">H", len(hs)) + hs
+
+
+# ---------------------------------------------------------------------------
+# SMB
+# ---------------------------------------------------------------------------
+
+
+def smb2_header(command: int, *, flags: int = 0, message_id: int = 0) -> bytes:
+    """A 64-byte SMB2 sync header (MS-SMB2 §2.2.1.2)."""
+    return (
+        b"\xfeSMB"
+        + struct.pack("<H", 64)  # structure size
+        + struct.pack("<H", 0)  # credit charge
+        + struct.pack("<I", 0)  # status / channel sequence
+        + struct.pack("<H", command)
+        + struct.pack("<H", 1)  # credits
+        + struct.pack("<I", flags)
+        + struct.pack("<I", 0)  # next command
+        + struct.pack("<Q", message_id)
+        + struct.pack("<I", 0)  # reserved
+        + struct.pack("<I", 0)  # tree id
+        + struct.pack("<Q", 0)  # session id
+        + b"\x00" * 16  # signature
+    )
+
+
+def smb2_tree_connect(path: str) -> bytes:
+    """SMB2 TREE_CONNECT request with a UNC ``path`` (e.g. ``\\\\host\\ADMIN$``)."""
+    hdr = smb2_header(3)
+    path_b = path.encode("utf-16-le")
+    # struct_size(2)=9 flags(2) path_offset(2)=72 path_length(2) buffer
+    body = struct.pack("<HHHH", 9, 0, 72, len(path_b)) + path_b
+    return hdr + body
+
+
+def smb2_session_setup(blob: bytes) -> bytes:
+    """SMB2 SESSION_SETUP carrying a security ``blob`` (e.g. an NTLM message)."""
+    hdr = smb2_header(1)
+    body = struct.pack("<HBBIIHHQ", 25, 0, 0, 0, 0, 88, len(blob), 0) + blob
+    return hdr + body
+
+
+def smb1_negotiate() -> bytes:
+    """A bare SMB1 packet (``\\xffSMB`` + command byte)."""
+    return b"\xffSMB" + bytes([0x72]) + b"\x00" * 27  # 0x72 = SMB_COM_NEGOTIATE
+
+
+def nbss_wrap(smb: bytes) -> bytes:
+    """Prepend a NetBIOS Session Service header (used on TCP/139)."""
+    length = len(smb)
+    return bytes([0x00, (length >> 16) & 0xFF, (length >> 8) & 0xFF, length & 0xFF]) + smb
+
+
+# ---------------------------------------------------------------------------
+# NTLMSSP
+# ---------------------------------------------------------------------------
+
+_NTLM_UNICODE = 0x00000001
+
+
+def ntlm_challenge(server_challenge: bytes = b"\x11" * 8, target: str = "CORP") -> bytes:
+    """A type-2 NTLMSSP CHALLENGE message carrying ``server_challenge``."""
+    target_b = target.encode("utf-16-le")
+    payload_off = 56
+    fixed = (
+        b"NTLMSSP\x00"
+        + struct.pack("<I", 2)  # type
+        + struct.pack("<HHI", len(target_b), len(target_b), payload_off)  # TargetName fields
+        + struct.pack("<I", _NTLM_UNICODE)  # flags
+        + server_challenge  # 8 bytes
+        + b"\x00" * 8  # reserved
+        + b"\x00" * 8  # TargetInfo fields (empty)
+        + b"\x00" * 8  # version
+    )
+    assert len(fixed) == payload_off
+    return fixed + target_b
+
+
+def ntlm_authenticate(
+    domain: str = "CORP",
+    user: str = "jdoe",
+    workstation: str = "WS01",
+    nt_response: bytes = b"\xaa" * 16 + b"\xbb" * 20,
+) -> bytes:
+    """A type-3 NTLMSSP AUTHENTICATE message (NTLMv2 NT response)."""
+    dom_b = domain.encode("utf-16-le")
+    usr_b = user.encode("utf-16-le")
+    ws_b = workstation.encode("utf-16-le")
+    payload_off = 72
+    dom_off = payload_off
+    usr_off = dom_off + len(dom_b)
+    ws_off = usr_off + len(usr_b)
+    nt_off = ws_off + len(ws_b)
+
+    def field(length: int, offset: int) -> bytes:
+        return struct.pack("<HHI", length, length, offset)
+
+    fixed = (
+        b"NTLMSSP\x00"
+        + struct.pack("<I", 3)  # type
+        + field(0, payload_off)  # LM response (empty)
+        + field(len(nt_response), nt_off)  # NT response
+        + field(len(dom_b), dom_off)  # domain
+        + field(len(usr_b), usr_off)  # user
+        + field(len(ws_b), ws_off)  # workstation
+        + field(0, payload_off)  # session key (empty)
+        + struct.pack("<I", _NTLM_UNICODE)  # flags
+        + b"\x00" * 8  # version
+    )
+    assert len(fixed) == payload_off
+    return fixed + dom_b + usr_b + ws_b + nt_response
+
+
+# ---------------------------------------------------------------------------
+# Kerberos — a tiny DER encoder, just enough to exercise the walker.
+# ---------------------------------------------------------------------------
+
+
+def _der_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    out = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(out)]) + out
+
+
+def der_tlv(tag: int, content: bytes) -> bytes:
+    return bytes([tag]) + _der_len(len(content)) + content
+
+
+def der_int(value: int) -> bytes:
+    if value == 0:
+        return der_tlv(0x02, b"\x00")
+    out = value.to_bytes((value.bit_length() + 8) // 8, "big")
+    return der_tlv(0x02, out)
+
+
+def der_genstr(s: str) -> bytes:
+    return der_tlv(0x1B, s.encode("ascii"))
+
+
+def der_octet(b: bytes) -> bytes:
+    return der_tlv(0x04, b)
+
+
+def der_seq(*items: bytes) -> bytes:
+    return der_tlv(0x30, b"".join(items))
+
+
+def der_ctx(num: int, content: bytes) -> bytes:
+    return der_tlv(0xA0 | num, content)  # context, constructed
+
+
+def der_app(num: int, content: bytes) -> bytes:
+    return der_tlv(0x60 | num, content)  # application, constructed
+
+
+def krb_principal(name_type: int, parts: tuple[str, ...]) -> bytes:
+    name_strings = der_seq(*[der_genstr(p) for p in parts])
+    return der_seq(der_ctx(0, der_int(name_type)), der_ctx(1, name_strings))
+
+
+def krb_as_req(
+    realm: str = "CORP.LOCAL",
+    cname: tuple[str, ...] = ("jdoe",),
+    sname: tuple[str, ...] = ("krbtgt", "CORP.LOCAL"),
+    etypes: tuple[int, ...] = (18, 17, 23),
+    with_preauth: bool = False,
+) -> bytes:
+    body = der_seq(
+        der_ctx(0, der_tlv(0x03, b"\x00\x00\x00\x00\x00")),  # kdc-options BIT STRING
+        der_ctx(1, krb_principal(1, cname)),
+        der_ctx(2, der_genstr(realm)),
+        der_ctx(3, krb_principal(2, sname)),
+        der_ctx(8, der_seq(*[der_int(e) for e in etypes])),
+    )
+    seq_items = [der_ctx(1, der_int(5)), der_ctx(2, der_int(10))]
+    if with_preauth:
+        padata = der_seq(der_seq(der_ctx(1, der_int(2)), der_ctx(2, der_octet(b"x"))))
+        seq_items.append(der_ctx(3, padata))
+    seq_items.append(der_ctx(4, body))
+    return der_app(10, der_seq(*seq_items))
+
+
+def krb_tgs_rep(
+    realm: str = "CORP.LOCAL",
+    cname: tuple[str, ...] = ("jdoe",),
+    sname: tuple[str, ...] = ("MSSQLSvc", "db01.corp.local"),
+    ticket_etype: int = 23,
+) -> bytes:
+    ticket_enc = der_seq(der_ctx(0, der_int(ticket_etype)), der_ctx(2, der_octet(b"\x00" * 16)))
+    ticket_seq = der_seq(
+        der_ctx(0, der_int(5)),
+        der_ctx(1, der_genstr(realm)),
+        der_ctx(2, krb_principal(2, sname)),
+        der_ctx(3, ticket_enc),
+    )
+    rep_enc = der_seq(der_ctx(0, der_int(18)), der_ctx(2, der_octet(b"\x00")))
+    seq = der_seq(
+        der_ctx(0, der_int(5)),
+        der_ctx(1, der_int(13)),
+        der_ctx(3, der_genstr(realm)),
+        der_ctx(4, krb_principal(1, cname)),
+        der_ctx(5, der_app(1, ticket_seq)),
+        der_ctx(6, rep_enc),
+    )
+    return der_app(13, seq)
+
+
+def krb_tcp(msg: bytes) -> bytes:
+    """Prepend the 4-byte big-endian length prefix Kerberos-over-TCP uses."""
+    return struct.pack(">I", len(msg)) + msg

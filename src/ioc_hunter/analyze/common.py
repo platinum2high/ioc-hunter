@@ -85,6 +85,7 @@ class FileFormat(StrEnum):
     OLE = "ole"  # Compound File Binary (.doc, .xls, .ppt, .msi, vbaProject.bin)
     RTF = "rtf"  # Rich Text Format — usually carries OLE exploit objects
     PCAP = "pcap"  # libpcap classic + PCAPNG (both surface as PCAP)
+    ARCHIVE = "archive"  # ZIP / TAR / GZIP / BZIP2 / XZ — recursively scanned
     UNKNOWN = "unknown"
 
 

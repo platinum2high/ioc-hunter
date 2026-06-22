@@ -34,15 +34,34 @@ from ioc_hunter.analyze.common import (
     Finding,
     Severity,
 )
+from ioc_hunter.analyze.pcap_auth import (
+    KERBEROS_PORTS,
+    KerberosRecord,
+    SMBRecord,
+    dissect_kerberos,
+    dissect_smb,
+    etype_name,
+    is_admin_share,
+    is_asrep_roastable,
+    is_kerberoastable,
+    is_rc4_downgrade,
+    is_smb_packet,
+    netntlmv2_hash,
+    parse_ntlmssp,
+)
 from ioc_hunter.analyze.pcap_heur import (
     detect_beacons,
     detect_dns_tunneling,
     detect_exfil,
     detect_icmp_tunnel,
     detect_scans,
+    detect_tls_anomalies,
     emit_findings,
+    emit_l7_findings,
     find_dga_names,
     find_ftp_credentials,
+    match_known_bad_ja3,
+    match_known_bad_ja3s,
 )
 from ioc_hunter.analyze.pcap_parse import (
     MAX_FRAMES,
@@ -55,13 +74,52 @@ from ioc_hunter.analyze.pcap_proto import (
     HTTPRequest,
     HTTPResponse,
     TLSClientHello,
+    TLSServerHello,
     _Stitcher,
     dissect_dns,
     dissect_http_request,
     dissect_http_response,
     dissect_tls_clienthello,
+    dissect_tls_serverhello,
     flag_bad_user_agent,
 )
+
+
+def _flow_key(pkt) -> tuple:
+    """Direction-agnostic flow key: canonicalise the two endpoints so the
+    NTLM CHALLENGE (server→client) and AUTHENTICATE (client→server) of one
+    exchange hash to the same bucket."""
+    return tuple(sorted(((pkt.src_ip, pkt.src_port), (pkt.dst_ip, pkt.dst_port))))
+
+
+def _harvest_ntlm(
+    pkt,
+    challenges: dict[tuple, bytes],
+    creds: list[tuple[str, str, str, str, str]],
+    *,
+    ntlm_seen: bool,
+) -> bool:
+    """Pull NTLMSSP messages from one SMB segment, pairing CHALLENGE→AUTH.
+
+    Stores the 8-byte server challenge per flow on a type-2 message, then
+    on the matching type-3 (AUTHENTICATE) assembles a crackable NetNTLMv2
+    hash. Returns the updated ``ntlm_seen`` flag.
+    """
+    msgs = parse_ntlmssp(pkt.payload)
+    if not msgs:
+        return ntlm_seen
+    key = _flow_key(pkt)
+    for m in msgs:
+        ntlm_seen = True
+        if m.msg_type == 2 and len(m.server_challenge) == 8:
+            challenges[key] = m.server_challenge
+        elif m.msg_type == 3:
+            chal = challenges.get(key)
+            if chal and len(creds) < 5000:
+                h = netntlmv2_hash(m.user, m.domain, chal, m.nt_response)
+                if h is not None:
+                    creds.append((m.user, m.domain, h, pkt.src_ip, pkt.dst_ip))
+    return ntlm_seen
 
 
 def analyze_pcap(raw: bytes, *, report: AnalyzerReport) -> None:
@@ -77,7 +135,18 @@ def analyze_pcap(raw: bytes, *, report: AnalyzerReport) -> None:
     http_requests: list[HTTPRequest] = []
     http_responses: list[HTTPResponse] = []
     tls_chs: list[TLSClientHello] = []
+    tls_shs: list[TLSServerHello] = []
     suspicious_uas: list[tuple[HTTPRequest, str]] = []
+
+    # ---- L7 auth / lateral-movement collection (phase 14.3b) --------------
+    smb_records: list[SMBRecord] = []
+    smb_admin_shares: list[tuple[str, str, str]] = []
+    smb1_pairs: set[tuple[str, str]] = set()
+    kerberos_records: list[KerberosRecord] = []
+    # NTLM challenge→response pairing, keyed by canonical flow endpoints.
+    ntlm_challenges: dict[tuple, bytes] = {}
+    netntlm_creds: list[tuple[str, str, str, str, str]] = []
+    ntlm_seen = False
 
     flow_table = FlowTable()
     stitcher = _Stitcher()
@@ -86,8 +155,10 @@ def analyze_pcap(raw: bytes, *, report: AnalyzerReport) -> None:
     # or a TLS ClientHello in a direction, stop re-parsing on every segment.
     parsed_http_dir: set[tuple[str, int, str, int]] = set()
     parsed_tls_dir: set[tuple[str, int, str, int]] = set()
+    parsed_tls_server_dir: set[tuple[str, int, str, int]] = set()
 
     seen_ja3: set[str] = set()
+    seen_ja3s: set[str] = set()
     frame_count = 0
     ts_first = 0.0
     ts_last = 0.0
@@ -132,6 +203,7 @@ def analyze_pcap(raw: bytes, *, report: AnalyzerReport) -> None:
 
             if (
                 dir_key not in parsed_tls_dir
+                and dir_key not in parsed_tls_server_dir
                 and dir_key not in parsed_http_dir
                 and stitched
                 and stitched[0] == 0x16
@@ -143,6 +215,36 @@ def analyze_pcap(raw: bytes, *, report: AnalyzerReport) -> None:
                     if len(tls_chs) < 5000:
                         tls_chs.append(ch)
                     seen_ja3.add(ch.ja3_md5)
+                else:
+                    sh = dissect_tls_serverhello(stitched, pkt)
+                    if sh is not None:
+                        parsed_tls_server_dir.add(dir_key)
+                        stitcher.drop(pkt)
+                        if len(tls_shs) < 5000:
+                            tls_shs.append(sh)
+                        seen_ja3s.add(sh.ja3s_md5)
+
+            # ---- SMB (445 / 139) -----------------------------------------
+            if is_smb_packet(pkt) and len(smb_records) < 20000:
+                smb = dissect_smb(pkt)
+                if smb is not None:
+                    smb_records.append(smb)
+                    if smb.dialect == "SMB1":
+                        smb1_pairs.add((pkt.src_ip, pkt.dst_ip))
+                    if smb.tree_path and is_admin_share(smb.tree_path):
+                        smb_admin_shares.append((pkt.src_ip, pkt.dst_ip, smb.tree_path))
+                ntlm_seen = _harvest_ntlm(pkt, ntlm_challenges, netntlm_creds, ntlm_seen=ntlm_seen)
+
+        # ---- Kerberos (88, TCP length-prefixed or UDP) -------------------
+        if (
+            pkt.proto in (IPProto.TCP, IPProto.UDP)
+            and (pkt.src_port in KERBEROS_PORTS or pkt.dst_port in KERBEROS_PORTS)
+            and pkt.payload
+            and len(kerberos_records) < 20000
+        ):
+            krb = dissect_kerberos(pkt.payload, tcp=(pkt.proto == IPProto.TCP))
+            if krb is not None:
+                kerberos_records.append(krb)
 
     if frame_count >= MAX_FRAMES:
         report.add(
@@ -177,6 +279,40 @@ def analyze_pcap(raw: bytes, *, report: AnalyzerReport) -> None:
         icmp_tunnels=icmp_tun,
         suspicious_uas=suspicious_uas,
         dns_messages_sample=dns_messages,
+    )
+
+    # ---- L7 auth / fingerprint findings (phase 14.3b) ---------------------
+    ja3_bad = [
+        (label, ch.ja3_md5, ch.src_ip, ch.dst_ip, ch.dst_port)
+        for ch in tls_chs
+        if (label := match_known_bad_ja3(ch.ja3_md5)) is not None
+    ]
+    ja3s_bad = [
+        (label, sh.ja3s_md5, sh.src_ip, sh.dst_ip, sh.src_port)
+        for sh in tls_shs
+        if (label := match_known_bad_ja3s(sh.ja3s_md5)) is not None
+    ]
+    tls_anomalies = detect_tls_anomalies(tls_chs)
+    kerberoast = [(k.cname, k.sname, k.realm) for k in kerberos_records if is_kerberoastable(k)]
+    asrep_roast = [(k.cname, k.realm) for k in kerberos_records if is_asrep_roastable(k)]
+    krb_downgrade = [
+        (k.cname, k.realm, "/".join(etype_name(e) for e in k.etypes))
+        for k in kerberos_records
+        if is_rc4_downgrade(k)
+    ]
+    # De-dup admin-share + SMB1 lists so a chatty session doesn't repeat them.
+    smb_admin_uniq = list(dict.fromkeys(smb_admin_shares))
+    emit_l7_findings(
+        report=report,
+        ja3_bad=ja3_bad,
+        ja3s_bad=ja3s_bad,
+        tls_anomalies=tls_anomalies,
+        smb_admin_shares=smb_admin_uniq,
+        smb1_pairs=sorted(smb1_pairs),
+        netntlm_creds=netntlm_creds,
+        kerberoast=kerberoast,
+        asrep_roast=asrep_roast,
+        krb_downgrade=krb_downgrade,
     )
 
     # ---- High-volume NXDOMAIN — combined signal ---------------------------
@@ -221,10 +357,26 @@ def analyze_pcap(raw: bytes, *, report: AnalyzerReport) -> None:
         },
         "tls": {
             "client_hellos": len(tls_chs),
+            "server_hellos": len(tls_shs),
             "distinct_ja3": len(seen_ja3),
+            "distinct_ja3s": len(seen_ja3s),
             "snis": sorted({ch.sni for ch in tls_chs if ch.sni})[:30],
             "ja3_sample": sorted(seen_ja3)[:10],
+            "ja3s_sample": sorted(seen_ja3s)[:10],
         },
+        "smb": {
+            "messages": len(smb_records),
+            "dialects": sorted({r.dialect for r in smb_records}),
+            "commands": sorted({r.command_name for r in smb_records})[:20],
+            "admin_shares": [unc for _, _, unc in smb_admin_uniq][:20],
+        },
+        "kerberos": {
+            "messages": len(kerberos_records),
+            "msg_types": sorted({k.msg_name for k in kerberos_records}),
+            "realms": sorted({k.realm for k in kerberos_records if k.realm})[:10],
+            "service_principals": sorted({k.sname for k in kerberos_records if k.sname})[:20],
+        },
+        "ntlm_observed": ntlm_seen,
     }
 
     # Carry IPs / domains / URLs the heuristics layer surfaced into the

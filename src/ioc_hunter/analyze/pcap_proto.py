@@ -14,10 +14,11 @@ Three protocols matter for SOC triage above L4 and they're handled here:
   they're a free credential leak that SOC analysts grade hard.
 
 - **TLS** — ClientHello extraction (SNI, version, cipher list, ext list,
-  EC curves, EC point formats) and the **JA3** fingerprint. JA3 is the
-  industry-standard client fingerprint and is what separates a
-  "screenshot pcap parser" from a tool a tier-3 analyst will actually
-  use. JA3S (server fingerprint) is a natural follow-up in 14.3b.
+  EC curves, EC point formats) and the **JA3** fingerprint, plus the
+  **ServerHello** → **JA3S** server fingerprint. JA3/JA3S are the
+  industry-standard fingerprints and are what separate a "screenshot
+  pcap parser" from a tool a tier-3 analyst will actually use; pairing a
+  flow's JA3 with its JA3S fingerprints the server implementation.
 
 Everything in this module operates on the ``Packet`` records yielded by
 ``pcap_parse.iter_packets``. We don't do full TCP stream reassembly —
@@ -136,6 +137,19 @@ class TLSClientHello:
     alpn: tuple[str, ...]  # ("h2", "http/1.1", ...) or ()
     ja3_string: str
     ja3_md5: str
+
+
+@dataclass(frozen=True, slots=True)
+class TLSServerHello:
+    ts: float
+    frame_no: int
+    src_ip: str  # the server (this record flows server → client)
+    dst_ip: str
+    src_port: int
+    tls_version: int
+    cipher: int  # the single cipher the server selected
+    ja3s_string: str
+    ja3s_md5: str
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +671,101 @@ def dissect_tls_clienthello(buf: bytes, pkt: Packet) -> TLSClientHello | None:
         alpn=tuple(alpn),
         ja3_string=ja3,
         ja3_md5=ja3_md5,
+    )
+
+
+def dissect_tls_serverhello(buf: bytes, pkt: Packet) -> TLSServerHello | None:
+    """Parse a stitched server→client TCP payload for the *first* ServerHello.
+
+    Computes **JA3S** per the published spec:
+
+        SSLVersion,Cipher,Extension
+
+    Unlike JA3 (client), the server selects a *single* cipher, so the
+    cipher field is one value, not a dash-joined list. The extension list
+    is dash-joined in wire order with GREASE stripped, exactly like JA3.
+    Result is hex(md5(string)).
+
+    Pairing a flow's JA3 (client) with its JA3S (server) is what lets an
+    analyst fingerprint a *server implementation* — the single strongest
+    tell for "this benign-looking 443 flow is actually a Cobalt Strike
+    teamserver", because the malleable C2 profile fixes both.
+    """
+    if len(buf) < 11:
+        return None
+    if buf[0] != 0x16:  # Handshake record
+        return None
+    rec_ver = struct.unpack(">H", buf[1:3])[0]
+    if rec_ver < 0x0300 or rec_ver > 0x0304:
+        return None
+    rec_len = struct.unpack(">H", buf[3:5])[0]
+    end_record = min(5 + rec_len, len(buf))
+    if buf[5] != 0x02:  # 0x02 = ServerHello
+        return None
+    hs_len = (buf[6] << 16) | (buf[7] << 8) | buf[8]
+    hs_end = min(9 + hs_len, end_record)
+    off = 9
+
+    cur = _read_u16(buf, off)
+    if cur is None:
+        return None
+    legacy_version, off = cur
+
+    cur = _read_bytes(buf, off, 32)  # server_random
+    if cur is None:
+        return None
+    _, off = cur
+
+    cur = _read_u8(buf, off)  # session_id len
+    if cur is None:
+        return None
+    sid_len, off = cur
+    cur = _read_bytes(buf, off, sid_len)
+    if cur is None:
+        return None
+    _, off = cur
+
+    cur = _read_u16(buf, off)  # the single selected cipher suite
+    if cur is None:
+        return None
+    cipher, off = cur
+
+    cur = _read_u8(buf, off)  # compression_method (single byte for server)
+    if cur is None:
+        return None
+    _, off = cur
+
+    extensions_list: list[int] = []
+    if off + 2 <= hs_end:
+        ext_total_len = struct.unpack(">H", buf[off : off + 2])[0]
+        off += 2
+        ext_end = min(off + ext_total_len, hs_end)
+        while off + 4 <= ext_end:
+            ext_type = struct.unpack(">H", buf[off : off + 2])[0]
+            ext_len = struct.unpack(">H", buf[off + 2 : off + 4])[0]
+            ext_data_end = off + 4 + ext_len
+            if ext_data_end > ext_end:
+                break
+            extensions_list.append(ext_type)
+            off = ext_data_end
+
+    extensions_clean = [e for e in extensions_list if e not in _GREASE]
+    ja3s = "{ver},{cipher},{exts}".format(
+        ver=legacy_version,
+        cipher=cipher,
+        exts="-".join(str(e) for e in extensions_clean),
+    )
+    ja3s_md5 = hashlib.md5(ja3s.encode("ascii")).hexdigest()
+    return TLSServerHello(
+        ts=pkt.ts,
+        frame_no=pkt.frame_no,
+        src_ip=pkt.src_ip,
+        dst_ip=pkt.dst_ip,
+        src_port=pkt.src_port,
+        tls_version=legacy_version,
+        cipher=cipher,
+        ja3s_string=ja3s,
+        ja3s_md5=ja3s_md5,
     )
 
 

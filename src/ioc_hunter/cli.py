@@ -427,13 +427,15 @@ def _entropy_bar(value: float, width: int = 10) -> str:
 
 _DOC_FORMATS = {FileFormat.PDF, FileFormat.OOXML, FileFormat.OLE, FileFormat.RTF}
 _PCAP_FORMATS = {FileFormat.PCAP}
-_NON_BINARY_FORMATS = _DOC_FORMATS | _PCAP_FORMATS
+_ARCHIVE_FORMATS = {FileFormat.ARCHIVE}
+_NON_BINARY_FORMATS = _DOC_FORMATS | _PCAP_FORMATS | _ARCHIVE_FORMATS
 
 
 def _render_analyze_header(report: AnalyzerReport) -> None:
     label, style = _VERDICT_TEXT[report.verdict]
     is_doc = report.format in _DOC_FORMATS
     is_pcap = report.format in _PCAP_FORMATS
+    is_archive = report.format in _ARCHIVE_FORMATS
     is_non_binary = report.format in _NON_BINARY_FORMATS
 
     # ---- Format line. Binaries get Arch / Bits; docs get the parser-
@@ -455,6 +457,10 @@ def _render_analyze_header(report: AnalyzerReport) -> None:
                 f"  [dim]Flows:[/] {summary.get('flows', 0):,}"
                 f"  [dim]Duration:[/] {summary.get('capture_duration_s', 0):.1f}s"
             )
+    elif is_archive:
+        kind = report.metadata.get("archive_kind") or "?"
+        count = report.metadata.get("archive_member_count", 0)
+        format_line += f"  [dim]Container:[/] {kind}  [dim]Members:[/] {count}"
     else:
         format_line += (
             f"  [dim]Arch:[/] {report.architecture or '—'}  [dim]Bits:[/] {report.bitness or '—'}"
@@ -529,9 +535,39 @@ def _render_analyze_header(report: AnalyzerReport) -> None:
         title = "Network Capture Analyzer"
     elif is_doc:
         title = "Document Analyzer"
+    elif is_archive:
+        title = "Archive Analyzer"
     else:
         title = "Binary Analyzer"
     console.print(Panel.fit("\n".join(lines), title=title, border_style=style))
+
+
+def _render_analyze_archive(report: AnalyzerReport) -> None:
+    """Render the per-member table for a recursively-scanned archive."""
+    members = report.metadata.get("archive_members")
+    if not members:
+        return
+    table = Table(title="Archive members", box=SIMPLE)
+    table.add_column("Member", style="cyan", overflow="fold")
+    table.add_column("Format", style="dim")
+    table.add_column("Verdict")
+    table.add_column("Findings", justify="right")
+    verdict_style = {
+        "malicious": "[red]malicious[/]",
+        "suspicious": "[yellow]suspicious[/]",
+        "clean": "[green]clean[/]",
+        "encrypted": "[yellow]encrypted[/]",
+    }
+    for m in members[:40]:
+        table.add_row(
+            _escape_markup(str(m.get("name", "?"))),
+            str(m.get("format", "?")),
+            verdict_style.get(m.get("verdict", ""), str(m.get("verdict", ""))),
+            str(m.get("findings", 0)),
+        )
+    if len(members) > 40:
+        table.add_row("…", "", "", f"+{len(members) - 40} more")
+    console.print(table)
 
 
 def _render_analyze_sections(report: AnalyzerReport) -> None:
@@ -707,14 +743,17 @@ def _render_analyze_pcap(report: AnalyzerReport) -> None:
             body_lines.append(f"[dim]User-Agents:[/] {_escape_markup(shown + extra)}")
         console.print(Panel.fit("\n".join(body_lines), title="HTTP", border_style="cyan"))
 
-    # ---- TLS / JA3 --------------------------------------------------------
+    # ---- TLS / JA3 / JA3S -------------------------------------------------
     tls = summary.get("tls") or {}
-    if tls.get("client_hellos"):
+    if tls.get("client_hellos") or tls.get("server_hellos"):
         snis = tls.get("snis") or []
         ja3 = tls.get("ja3_sample") or []
+        ja3s = tls.get("ja3s_sample") or []
         body_lines = [
             f"[dim]ClientHellos:[/] {tls.get('client_hellos', 0):,}     "
-            f"[dim]Distinct JA3:[/] {tls.get('distinct_ja3', 0)}"
+            f"[dim]ServerHellos:[/] {tls.get('server_hellos', 0):,}\n"
+            f"[dim]Distinct JA3:[/] {tls.get('distinct_ja3', 0)}     "
+            f"[dim]Distinct JA3S:[/] {tls.get('distinct_ja3s', 0)}"
         ]
         if snis:
             shown = ", ".join(snis[:8])
@@ -722,7 +761,41 @@ def _render_analyze_pcap(report: AnalyzerReport) -> None:
             body_lines.append(f"[dim]SNIs:[/] {_escape_markup(shown + extra)}")
         if ja3:
             body_lines.append("[dim]JA3:[/] " + ", ".join(ja3[:6]))
+        if ja3s:
+            body_lines.append("[dim]JA3S:[/] " + ", ".join(ja3s[:6]))
         console.print(Panel.fit("\n".join(body_lines), title="TLS", border_style="cyan"))
+
+    # ---- SMB --------------------------------------------------------------
+    smb = summary.get("smb") or {}
+    if smb.get("messages"):
+        body_lines = [
+            f"[dim]Messages:[/] {smb.get('messages', 0):,}     "
+            f"[dim]Dialects:[/] {', '.join(smb.get('dialects') or []) or '—'}"
+        ]
+        cmds = smb.get("commands") or []
+        if cmds:
+            body_lines.append(f"[dim]Commands:[/] {_escape_markup(', '.join(cmds[:10]))}")
+        shares = smb.get("admin_shares") or []
+        if shares:
+            body_lines.append(f"[red]Admin shares:[/] {_escape_markup(', '.join(shares[:6]))}")
+        console.print(Panel.fit("\n".join(body_lines), title="SMB", border_style="cyan"))
+
+    # ---- Kerberos ---------------------------------------------------------
+    krb = summary.get("kerberos") or {}
+    if krb.get("messages"):
+        body_lines = [
+            f"[dim]Messages:[/] {krb.get('messages', 0):,}     "
+            f"[dim]Types:[/] {', '.join(krb.get('msg_types') or []) or '—'}"
+        ]
+        realms = krb.get("realms") or []
+        if realms:
+            body_lines.append(f"[dim]Realms:[/] {_escape_markup(', '.join(realms[:6]))}")
+        spns = krb.get("service_principals") or []
+        if spns:
+            shown = ", ".join(spns[:6])
+            extra = f", +{len(spns) - 6}" if len(spns) > 6 else ""
+            body_lines.append(f"[dim]Service principals:[/] {_escape_markup(shown + extra)}")
+        console.print(Panel.fit("\n".join(body_lines), title="Kerberos", border_style="cyan"))
 
 
 def _render_analyze_iocs(report: AnalyzerReport) -> None:
@@ -851,6 +924,7 @@ async def _run_analyze(
     _render_analyze_sections(report)
     _render_analyze_imports(report)
     _render_analyze_pcap(report)
+    _render_analyze_archive(report)
     _render_analyze_findings(report)
     _render_analyze_iocs(report)
 

@@ -52,6 +52,7 @@ from ioc_hunter.analyze.pcap_proto import (
     DNSMessage,
     DNSStats,
     HTTPRequest,
+    TLSClientHello,
 )
 
 # ---------------------------------------------------------------------------
@@ -506,6 +507,85 @@ def detect_icmp_tunnel(packets: list[Packet]) -> list[ICMPTunnelCandidate]:
 
 
 # ---------------------------------------------------------------------------
+# TLS fingerprint intelligence + anomalies
+# ---------------------------------------------------------------------------
+
+#: Publicly reported JA3 hashes associated with offensive tooling. JA3 is
+#: a TLS-stack fingerprint, so a match means "this client speaks TLS the
+#: way that tool's default profile does" — strong, but not proof on its
+#: own (a benign app sharing the same TLS library collides). We surface it
+#: at MEDIUM; combined with beaconing/DGA the verdict escalates naturally.
+KNOWN_BAD_JA3: dict[str, str] = {
+    "72a589da586844d7f0818ce684948eea": "Cobalt Strike (default profile)",
+    "a0e9f5d64349fb13191bc781f81f42e1": "Metasploit / Meterpreter reverse_https",
+    "b386946a5a44d1ddcc843bc75336dfce": "Metasploit (Java Meterpreter)",
+    "06d47c8d6f2b1f0b6e6a5f2b8e2c9a1e": "Trickbot (reported)",
+    "e7d705a3286e19ea42f587b344ee6865": "Emotet (reported)",
+}
+
+#: Publicly reported JA3S (server) hashes for offensive C2 servers.
+KNOWN_BAD_JA3S: dict[str, str] = {
+    "623de93db17d313345d7ea481e7443cf": "Cobalt Strike teamserver (default)",
+    "ec74a5c51106f0419184d0dd08fb05bc": "Metasploit handler (reported)",
+}
+
+#: Ports where TLS is expected. A ClientHello to anything else is a
+#: non-standard-port C2 tell (T1571).
+STANDARD_TLS_PORTS = frozenset({443, 465, 563, 636, 853, 989, 990, 992, 993, 994, 995, 5061, 8443})
+
+
+def match_known_bad_ja3(md5: str) -> str | None:
+    return KNOWN_BAD_JA3.get(md5)
+
+
+def match_known_bad_ja3s(md5: str) -> str | None:
+    return KNOWN_BAD_JA3S.get(md5)
+
+
+@dataclass(frozen=True, slots=True)
+class TLSAnomaly:
+    kind: str  # "non_standard_port" | "no_sni"
+    src_ip: str
+    dst_ip: str
+    dst_port: int
+    detail: str
+
+
+def detect_tls_anomalies(client_hellos: list[TLSClientHello]) -> list[TLSAnomaly]:
+    """Flag ClientHellos on non-standard ports or with no SNI on 443.
+
+    - **non-standard port**: TLS where you don't expect it is a classic
+      way C2 hides from port-based filtering.
+    - **no SNI on 443**: legitimate browsers always send SNI; a 443 flow
+      with none is usually a client connecting to a bare IP — common for
+      implants that pin their C2 by address.
+    """
+    out: list[TLSAnomaly] = []
+    for ch in client_hellos:
+        if ch.dst_port not in STANDARD_TLS_PORTS:
+            out.append(
+                TLSAnomaly(
+                    kind="non_standard_port",
+                    src_ip=ch.src_ip,
+                    dst_ip=ch.dst_ip,
+                    dst_port=ch.dst_port,
+                    detail=f"TLS ClientHello to non-standard port {ch.dst_port}",
+                )
+            )
+        elif ch.dst_port == 443 and not ch.sni:
+            out.append(
+                TLSAnomaly(
+                    kind="no_sni",
+                    src_ip=ch.src_ip,
+                    dst_ip=ch.dst_ip,
+                    dst_port=ch.dst_port,
+                    detail="TLS ClientHello on 443 with no SNI (direct-IP C2 tell)",
+                )
+            )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Finding emission — converts the candidate records above into AnalyzerReport
 # findings. Centralised here so wording/severity stays consistent.
 # ---------------------------------------------------------------------------
@@ -671,6 +751,140 @@ def emit_findings(
         )
     # The aggregate NXDOMAIN-ratio signal is computed in ``pcap.analyze_pcap``
     # because it needs ``DNSStats`` directly rather than the message sample.
+
+
+def emit_l7_findings(
+    *,
+    report: AnalyzerReport,
+    ja3_bad: list[tuple[str, str, str, str, int]],
+    ja3s_bad: list[tuple[str, str, str, str, int]],
+    tls_anomalies: list[TLSAnomaly],
+    smb_admin_shares: list[tuple[str, str, str]],
+    smb1_pairs: list[tuple[str, str]],
+    netntlm_creds: list[tuple[str, str, str, str, str]],
+    kerberoast: list[tuple[str, str, str]],
+    asrep_roast: list[tuple[str, str]],
+    krb_downgrade: list[tuple[str, str, str]],
+) -> None:
+    """Emit findings for the TLS-fingerprint / SMB / NTLM / Kerberos layer."""
+    for label, md5, src, dst, port in ja3_bad[:20]:
+        report.add(
+            Finding(
+                rule="pcap.ja3_known_bad",
+                severity=Severity.MEDIUM,
+                category="c2",
+                message=(
+                    f"JA3 {md5} matches a known offensive profile ({label}) — {src} → {dst}:{port}"
+                ),
+                evidence=(md5, label),
+            )
+        )
+    for label, md5, server_ip, _dst, port in ja3s_bad[:20]:
+        report.add(
+            Finding(
+                rule="pcap.ja3s_known_bad",
+                severity=Severity.MEDIUM,
+                category="c2",
+                message=(
+                    f"JA3S {md5} matches a known C2 server profile "
+                    f"({label}) — server {server_ip}:{port}"
+                ),
+                evidence=(md5, label),
+            )
+        )
+    for anom in tls_anomalies[:20]:
+        report.add(
+            Finding(
+                rule=(
+                    "pcap.tls_non_standard_port"
+                    if anom.kind == "non_standard_port"
+                    else "pcap.tls_no_sni"
+                ),
+                severity=(Severity.MEDIUM if anom.kind == "non_standard_port" else Severity.LOW),
+                category="c2",
+                message=f"{anom.detail} — {anom.src_ip} → {anom.dst_ip}:{anom.dst_port}",
+                evidence=(f"{anom.src_ip}->{anom.dst_ip}:{anom.dst_port}",),
+            )
+        )
+    for src, dst, unc in smb_admin_shares[:20]:
+        report.add(
+            Finding(
+                rule="pcap.smb_admin_share",
+                severity=Severity.HIGH,
+                category="lateral_movement",
+                message=(
+                    f"SMB TREE_CONNECT to administrative share {unc} "
+                    f"({src} → {dst}) — PsExec/wmiexec-style lateral movement"
+                ),
+                evidence=(unc, f"{src}->{dst}"),
+            )
+        )
+    for src, dst in smb1_pairs[:10]:
+        report.add(
+            Finding(
+                rule="pcap.smb1_in_use",
+                severity=Severity.MEDIUM,
+                category="anomaly",
+                message=(
+                    f"Legacy SMB1 dialect in use {src} → {dst} — deprecated and "
+                    f"the transport EternalBlue (MS17-010) abuses"
+                ),
+                evidence=(f"{src}->{dst}",),
+            )
+        )
+    for user, domain, hash_str, src, dst in netntlm_creds[:20]:
+        who = f"{domain}\\{user}" if domain else user
+        report.add(
+            Finding(
+                rule="pcap.netntlmv2_capture",
+                severity=Severity.HIGH,
+                category="credentials",
+                message=(
+                    f"NetNTLMv2 response captured for {who} ({src} → {dst}) — "
+                    f"crackable offline (hashcat -m 5600)"
+                ),
+                evidence=(hash_str,),
+            )
+        )
+    for user, service, realm in kerberoast[:20]:
+        report.add(
+            Finding(
+                rule="pcap.kerberoasting",
+                severity=Severity.HIGH,
+                category="credentials",
+                message=(
+                    f"Kerberos service ticket for {service}@{realm} issued under "
+                    f"RC4-HMAC (requested by {user or 'unknown'}) — Kerberoastable"
+                ),
+                evidence=(service, realm),
+            )
+        )
+    for user, realm in asrep_roast[:20]:
+        report.add(
+            Finding(
+                rule="pcap.asrep_roasting",
+                severity=Severity.HIGH,
+                category="credentials",
+                message=(
+                    f"AS-REQ for {user or 'unknown'}@{realm} with no pre-authentication "
+                    f"— account is AS-REP roastable"
+                ),
+                evidence=(user, realm),
+            )
+        )
+    for user, realm, offered in krb_downgrade[:20]:
+        report.add(
+            Finding(
+                rule="pcap.kerberos_rc4_downgrade",
+                severity=Severity.MEDIUM,
+                category="c2",
+                message=(
+                    f"Kerberos request from {user or 'unknown'}@{realm} offers RC4 "
+                    f"but not AES ({offered}) — encryption-downgrade tell"
+                ),
+                evidence=(user, realm),
+            )
+        )
 
 
 # A method on a frozen dataclass is fine — we attach it via a small helper

@@ -139,6 +139,22 @@ _MAP: dict[str, tuple[str, ...]] = {
     "pcap.plaintext_http_basic": ("T1040",),
     "pcap.icmp_tunnel": ("T1095", "T1572"),  # Non-App-Layer C2
     "pcap.suspicious_user_agent": ("T1071.001",),
+    # ---- TLS fingerprint / SMB / NTLM / Kerberos (phase 14.3b) -------------
+    "pcap.ja3_known_bad": ("T1071.001", "T1573.001"),  # App-layer + encrypted C2
+    "pcap.ja3s_known_bad": ("T1071.001", "T1573.001"),
+    "pcap.tls_non_standard_port": ("T1571", "T1573.001"),  # Non-Standard Port
+    "pcap.tls_no_sni": ("T1071.001",),
+    "pcap.smb_admin_share": ("T1021.002", "T1570"),  # SMB Admin Shares / Lateral Tool Transfer
+    "pcap.smb1_in_use": ("T1210",),  # Exploitation of Remote Services (MS17-010 transport)
+    "pcap.netntlmv2_capture": ("T1040", "T1557.001"),  # Sniffing / LLMNR-NBT-NS + SMB relay
+    "pcap.kerberoasting": ("T1558.003",),  # Kerberoasting
+    "pcap.asrep_roasting": ("T1558.004",),  # AS-REP Roasting
+    "pcap.kerberos_rc4_downgrade": ("T1558.003", "T1550"),
+    # ---- Recursive archive analyzer (phase 14.3b) -------------------------
+    "archive.executable_payload": ("T1204.002", "T1566.001"),  # User Execution / attachment
+    "archive.encrypted_member": ("T1027", "T1027.002"),  # Obfuscation to evade AV
+    "archive.member_malicious": ("T1027.009",),  # Embedded Payloads
+    "archive.member_suspicious": ("T1027.009",),
 }
 
 
