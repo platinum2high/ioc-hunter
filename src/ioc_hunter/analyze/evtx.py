@@ -67,8 +67,9 @@ _FILETIME_EPOCH_DIFF = 11644473600
 
 _TOK_EOF = 0x00
 _TOK_OPEN_ELEM = 0x01
-_TOK_CLOSE_ELEM = 0x02
-_TOK_CLOSE_EMPTY = 0x03
+_TOK_CLOSE_ELEM = 0x02   # CloseStartElement (closes opening tag `>`; in fixtures also used as CloseElement)
+_TOK_CLOSE_EMPTY = 0x03  # CloseEmptyElement (`/>`)
+_TOK_END_ELEM = 0x04     # EndElement (`</tag>`) — real EVTX only
 _TOK_VALUE = 0x05
 _TOK_ATTR = 0x06
 _TOK_TMPL_INST = 0x0C
@@ -92,6 +93,7 @@ _VT_SYSTEMTIME = 0x12
 _VT_SID = 0x13
 _VT_HEX32 = 0x14
 _VT_HEX64 = 0x15
+_VT_BXML  = 0x21  # embedded BinXML (EventData section)
 
 # Flag: value is null (bit 7 of the flags byte in descriptor)
 _FLAG_NULL = 0x80
@@ -238,19 +240,19 @@ class _Cursor:
 def _binxml_name(data: bytes, offset: int) -> str:
     """Read a BinXML element/attribute name from an absolute offset.
 
-    Name layout: next_offset(4) + hash(4) + length_chars(2) + unknown(2)
-                 + UTF-16LE chars (length_chars x 2 bytes)
+    Name layout (NameStringNode): next_offset(4) + hash(2) + length_chars(2)
+                                  + UTF-16LE chars (length_chars × 2) + null(2)
     """
-    if offset + 12 > len(data):
+    if offset + 8 > len(data):
         return ""
-    (length,) = struct.unpack_from("<H", data, offset + 8)
+    (length,) = struct.unpack_from("<H", data, offset + 6)
     if length == 0:
         return ""
-    end = offset + 12 + length * 2
+    end = offset + 8 + length * 2
     if end > len(data):
         return ""
     try:
-        return data[offset + 12 : end].decode("utf-16-le", errors="replace")
+        return data[offset + 8 : end].decode("utf-16-le", errors="replace")
     except Exception:
         return ""
 
@@ -391,22 +393,43 @@ def _read_typed_value(r: _Cursor, vtype: int) -> str:
 class _TemplateInfo:
     field_map: dict[int, str]       # subst_id → field_name
     data_name_map: dict[int, str]   # subst_id → EventData Name attribute value
+    literal_fields: dict[str, str]  # canonical field_name → literal value from template
 
 
-def _parse_template_binxml(binxml: bytes) -> _TemplateInfo:
+def _parse_template_binxml(
+    binxml: bytes,
+    chunk: bytes,
+    binxml_start: int,
+) -> _TemplateInfo:
     """Walk template BinXML and build substitution_id → field_name mapping.
 
-    In a template, NormalSubstitution / OptionalSubstitution tokens mark
-    where values will be injected.  We track the current element / attribute
-    context so we know what each substitution position means.
+    In real EVTX, element/attribute names appear INLINE in the token stream
+    the first time they are used (NameStringNode embedded right after the
+    token's name_off field, and after flag bytes for 0x41 tokens).  We must
+    skip those inline records when the name_off points at or beyond the
+    current cursor position in the chunk.
+
+    Parameters
+    ----------
+    binxml:       slice of the chunk containing only the template BinXML
+    chunk:        full 65536-byte chunk (names are chunk-relative)
+    binxml_start: byte offset within chunk where binxml begins
     """
     field_map: dict[int, str] = {}
-    data_name_map: dict[int, str] = {}  # filled for <Data Name="..."> stubs
+    data_name_map: dict[int, str] = {}
+    literal_fields: dict[str, str] = {}
     r = _Cursor(binxml)
     elem_stack: list[str] = []
     attr_pending: str = ""
-    # Track pending Data Name attribute value (a Value token inside an Attr token)
     pending_data_name: str = ""
+
+    def _skip_inline_name(name_off: int) -> None:
+        """If name_off is ahead of the current cursor, skip its NameStringNode."""
+        cur_chunk_pos = binxml_start + r.pos
+        if name_off >= cur_chunk_pos and name_off + 8 <= len(chunk):
+            (ns_len,) = struct.unpack_from("<H", chunk, name_off + 6)
+            # NameStringNode: next_off(4)+hash(2)+len(2)+name(ns_len×2)+null(2)
+            r.skip(10 + ns_len * 2)
 
     while r.remaining > 0:
         tok = r.u8()
@@ -416,60 +439,69 @@ def _parse_template_binxml(binxml: bytes) -> _TemplateInfo:
         if tok == _TOK_FRAG_HDR:
             r.skip(3)
 
-        elif tok == _TOK_OPEN_ELEM:
+        elif tok in (_TOK_OPEN_ELEM, 0x41):  # OpenStartElement (plain / with flag)
+            has_flag = bool(tok & 0x40)
             r.skip(2)   # dep_id
             r.skip(4)   # data_size
             name_off = r.u32()
             if name_off is None:
                 break
-            name = _binxml_name(binxml, name_off)
+            _skip_inline_name(name_off)
+            if has_flag:
+                r.skip(4)   # extra 4 flag bytes present on 0x41 tokens
+            name = _binxml_name(chunk, name_off)
             elem_stack.append(name)
             pending_data_name = ""
 
-        elif tok in (_TOK_CLOSE_ELEM, _TOK_CLOSE_EMPTY):
+        elif tok == _TOK_CLOSE_ELEM:  # 0x02 CloseStartElement — children follow
+            pass  # do NOT pop; element is still open, content tokens come next
+
+        elif tok in (_TOK_CLOSE_EMPTY, _TOK_END_ELEM):  # 0x03 or 0x04
             if elem_stack:
                 elem_stack.pop()
 
-        elif tok == _TOK_ATTR:
+        elif tok in (_TOK_ATTR, 0x46):  # Attribute (plain / with flag)
             name_off = r.u32()
             if name_off is None:
                 break
-            attr_pending = _binxml_name(binxml, name_off)
+            _skip_inline_name(name_off)
+            attr_pending = _binxml_name(chunk, name_off)
 
         elif tok == _TOK_VALUE:
             vtype = r.u8()
             if vtype is None:
                 break
             val = _read_typed_value(r, vtype)
-            # If we're reading the "Name" attribute of a <Data> element, cache it
             if attr_pending == "Name" and elem_stack and elem_stack[-1] == "Data":
                 pending_data_name = val
+            elif val and elem_stack and not attr_pending:
+                # Literal element content (e.g. Computer name hardcoded in template)
+                ctx = _subst_context_name(elem_stack[-1], "")
+                if ctx:
+                    literal_fields[ctx] = val
             attr_pending = ""
 
-        elif tok in (_TOK_NORM_SUBST, _TOK_OPT_SUBST):
+        elif tok in (_TOK_NORM_SUBST, _TOK_OPT_SUBST, 0x4D, 0x4E):
             subst_id = r.u16()
             vtype = r.u8()
             if subst_id is None:
                 break
-            # Determine field name from context
             elem = elem_stack[-1] if elem_stack else ""
             if elem == "Data" and pending_data_name:
-                # EventData <Data Name="FieldName">%N</Data> substitution
                 field_map[subst_id] = pending_data_name
                 data_name_map[subst_id] = pending_data_name
             else:
-                # System element — use well-known mapping as baseline,
-                # then override with context-derived name when possible.
                 ctx_name = _subst_context_name(elem, attr_pending)
                 if ctx_name:
                     field_map[subst_id] = ctx_name
-                elif subst_id in _SYSTEM_SUBST:
-                    field_map[subst_id] = _SYSTEM_SUBST[subst_id]
+                # No _SYSTEM_SUBST fallback here — only record what the template
+                # explicitly tells us; the fallback lives in _apply_template_instance
+                # for events whose template cannot be loaded at all.
             attr_pending = ""
 
-        # Any other token: skip (handles CharRef, EntityRef, PI, CData)
+        # Any other token: skip (CharRef, EntityRef, PI, CData, …)
 
-    return _TemplateInfo(field_map=field_map, data_name_map=data_name_map)
+    return _TemplateInfo(field_map=field_map, data_name_map=data_name_map, literal_fields=literal_fields)
 
 
 def _subst_context_name(elem: str, attr: str) -> str:
@@ -556,8 +588,9 @@ def _load_template(
     (data_size,) = struct.unpack_from("<I", chunk, offset + 20)
     if data_size > len(chunk) - (offset + 24):
         return None
-    binxml = chunk[offset + 24 : offset + 24 + data_size]
-    info = _parse_template_binxml(binxml)
+    binxml_start = offset + 24
+    binxml = chunk[binxml_start : binxml_start + data_size]
+    info = _parse_template_binxml(binxml, chunk, binxml_start)
     cache[offset] = info
     return info
 
@@ -571,6 +604,7 @@ def _parse_event_binxml(
     binxml: bytes,
     chunk: bytes,
     tmpl_cache: dict[int, _TemplateInfo],
+    binxml_start: int = 0,
 ) -> dict[str, str]:
     """Walk BinXML of one event record and return field_name → value dict.
 
@@ -640,7 +674,7 @@ def _parse_event_binxml(
                     fields[elem] = val[:_MAX_FIELD_LEN]
 
         elif tok == _TOK_TMPL_INST:
-            _apply_template_instance(r, binxml, chunk, tmpl_cache, fields)
+            _apply_template_instance(r, binxml, chunk, tmpl_cache, fields, binxml_start)
 
         elif tok in (_TOK_NORM_SUBST, _TOK_OPT_SUBST):
             # Substitution marker inside a template body — skip in record context
@@ -683,28 +717,117 @@ def _inline_attr_key(elem: str, attr: str, fields: dict[str, str]) -> str:
     return elem
 
 
+def _parse_bxml_blob(
+    blob: bytes,
+    chunk: bytes,
+    blob_chunk_start: int,
+    tmpl_cache: dict[int, _TemplateInfo],
+    fields: dict[str, str],
+) -> None:
+    """Parse an embedded BXml (vtype=0x21) substitution value.
+
+    EventData and similar sections are stored as a self-contained BinXML blob
+    that itself contains a TemplateInstance referencing a nested template.
+    This function drives that inner template/substitution array and merges
+    the decoded field values into `fields`.
+    """
+    r = _Cursor(blob)
+    if r.remaining < 1:
+        return
+
+    # Optional FragHeader
+    if r.data[r.pos] == _TOK_FRAG_HDR:
+        r.skip(4)
+
+    tok = r.u8()
+    if tok != _TOK_TMPL_INST:
+        return
+
+    r.skip(1)   # unknown
+    r.skip(4)   # template_id
+    tmpl_offset = r.u32()
+    if tmpl_offset is None:
+        return
+
+    # Skip resident (inline) template definition
+    if tmpl_offset == blob_chunk_start + r.pos and tmpl_offset + 24 <= len(chunk):
+        (data_length,) = struct.unpack_from("<I", chunk, tmpl_offset + 20)
+        if not r.skip(24 + data_length):
+            return
+
+    num_values = r.u32()
+    if num_values is None or num_values > 512:
+        return
+
+    descriptors: list[tuple[int, int, int]] = []
+    for _ in range(num_values):
+        sz = r.u16()
+        vt = r.u8()
+        fl = r.u8()
+        if sz is None or vt is None or fl is None:
+            return
+        descriptors.append((sz, vt, fl))
+
+    total = sum(d[0] for d in descriptors)
+    value_blob = r.read(total)
+    if value_blob is None:
+        return
+
+    tmpl: _TemplateInfo | None = None
+    if tmpl_offset < len(chunk):
+        tmpl = _load_template(chunk, tmpl_offset, tmpl_cache)
+
+    blob_pos = 0
+    for i, (sz, vt, fl) in enumerate(descriptors):
+        vdata = value_blob[blob_pos : blob_pos + sz]
+        blob_pos += sz
+        if fl & _FLAG_NULL or sz == 0:
+            continue
+        field_name = tmpl.field_map.get(i, "") if tmpl else ""
+        if not field_name:
+            continue
+        decoded = _decode_value(vdata, vt)
+        if decoded and len(field_name) <= 64:
+            fields[field_name] = decoded[:_MAX_FIELD_LEN]
+
+
 def _apply_template_instance(
     r: _Cursor,
     binxml: bytes,
     chunk: bytes,
     tmpl_cache: dict[int, _TemplateInfo],
     fields: dict[str, str],
+    binxml_start: int = 0,
 ) -> None:
     """Handle a TemplateInstance (0x0C) token.
 
-    Reads the substitution descriptor array and value data, then maps each
-    substitution position to a field name using the template definition.
-    Falls back to _SYSTEM_SUBST when the template isn't available.
+    EVTX TemplateInstance layout (after the tok byte consumed by the caller):
+      unknown(1) + template_id(4) + template_offset(4)   = 9 bytes
+    If the template definition is resident (starts exactly where the cursor
+    now sits in the chunk), it is embedded inline and must be skipped:
+      TemplateNode header(24) + BinXML(data_length)
+    After that comes the substitution array:
+      sub_count(4) + sub_count × descriptor(4) + value blob
     """
     unknown = r.u8()
     if unknown is None:
         return
-    template_guid = r.read(16)
-    if template_guid is None:
+    if not r.skip(4):  # template_id (first 4 bytes of GUID, used as a lookup key)
         return
-    data_offset = r.u32()   # offset within chunk to template def
+    data_offset = r.u32()   # chunk-relative offset to template def node
+    if data_offset is None:
+        return
+
+    # A "resident" template is defined inline right at the current cursor
+    # position (data_offset == binxml_start + r.pos after reading the header).
+    # We must skip over it to reach the substitution array that follows.
+    if data_offset == binxml_start + r.pos and data_offset + 24 <= len(chunk):
+        (data_length,) = struct.unpack_from("<I", chunk, data_offset + 20)
+        if not r.skip(24 + data_length):
+            return
+
     num_values = r.u32()
-    if data_offset is None or num_values is None or num_values > 512:
+    if num_values is None or num_values > 512:
         return
 
     # Read descriptor array: (size, type, flags) per value
@@ -719,6 +842,7 @@ def _apply_template_instance(
 
     # Read all value data in one block
     total = sum(d[0] for d in descriptors)
+    value_blob_chunk_start = binxml_start + r.pos   # chunk-relative start of value blob
     value_blob = r.read(total)
     if value_blob is None:
         return
@@ -732,11 +856,15 @@ def _apply_template_instance(
     blob_pos = 0
     for i, (sz, vt, fl) in enumerate(descriptors):
         vdata = value_blob[blob_pos : blob_pos + sz]
+        entry_chunk_start = value_blob_chunk_start + blob_pos
         blob_pos += sz
 
-        if fl & _FLAG_NULL:
+        if fl & _FLAG_NULL or sz == 0:
             continue
-        if sz == 0:
+
+        # Embedded BXml (EventData and similar): parse recursively
+        if vt == _VT_BXML:
+            _parse_bxml_blob(vdata, chunk, entry_chunk_start, tmpl_cache, fields)
             continue
 
         # Determine field name
@@ -751,6 +879,13 @@ def _apply_template_instance(
         decoded = _decode_value(vdata, vt)
         if decoded and len(field_name) <= 64:
             fields[field_name] = decoded[:_MAX_FIELD_LEN]
+
+    # Apply template-level literal fields (e.g. Computer name hardcoded in template).
+    # Substitution values take priority, so only fill in what's still missing.
+    if tmpl is not None:
+        for fname, fval in tmpl.literal_fields.items():
+            if fname not in fields:
+                fields[fname] = fval[:_MAX_FIELD_LEN]
 
 
 # ---------------------------------------------------------------------------
@@ -775,14 +910,17 @@ def _iter_chunks(raw: bytes) -> Iterator[tuple[int, bytes]]:
         count += 1
 
 
-def _iter_chunk_records(chunk: bytes) -> Iterator[tuple[int, int, bytes]]:
-    """Yield (record_id, filetime, binxml_bytes) for each record in a chunk.
+def _iter_chunk_records(chunk: bytes) -> Iterator[tuple[int, int, bytes, int]]:
+    """Yield (record_id, filetime, binxml_bytes, binxml_start) for each record in a chunk.
 
     Records start after the chunk header block (EVTX_CHUNK_HEADER_TOTAL =
     512 bytes).  Each record begins with EVTX_RECORD_MAGIC followed by a
     4-byte size field.  We scan sequentially rather than relying on the
     free_space_offset from the chunk header so we remain correct on files
     with dirty flags or aborted writes.
+
+    binxml_start is the chunk-relative offset where the binxml begins, needed
+    to detect resident (inline) template definitions.
     """
     pos = EVTX_CHUNK_HEADER_TOTAL
     n = len(chunk)
@@ -801,9 +939,9 @@ def _iter_chunk_records(chunk: bytes) -> Iterator[tuple[int, int, bytes]]:
 
         record_id = struct.unpack_from("<Q", chunk, pos + 8)[0]
         filetime = struct.unpack_from("<Q", chunk, pos + 16)[0]
-        # BinXML starts immediately after the 24-byte record header
-        binxml = chunk[pos + EVTX_RECORD_HEADER_SIZE : pos + size]
-        yield record_id, filetime, binxml
+        binxml_start = pos + EVTX_RECORD_HEADER_SIZE
+        binxml = chunk[binxml_start : pos + size]
+        yield record_id, filetime, binxml, binxml_start
         pos += size
 
 
@@ -813,9 +951,10 @@ def _decode_record(
     binxml: bytes,
     chunk: bytes,
     tmpl_cache: dict[int, _TemplateInfo],
+    binxml_start: int = 0,
 ) -> _EvtxEvent:
     """Decode one event record from its BinXML payload."""
-    fields = _parse_event_binxml(binxml, chunk, tmpl_cache)
+    fields = _parse_event_binxml(binxml, chunk, tmpl_cache, binxml_start)
 
     event_id_str = fields.get("EventID", "0")
     try:
@@ -1416,7 +1555,111 @@ def _detect(events: list[_EvtxEvent], report: AnalyzerReport) -> None:
         ))
 
     # -----------------------------------------------------------------
-    # 19. Sysmon — suspicious network connections (Event 3)
+    # 19. Sysmon — named pipe abuse (Events 17/18) — token impersonation
+    # -----------------------------------------------------------------
+    # Patterns: EfsPotato / PrintSpoofer / JuicyPotato create a pipe that
+    # tricks a privileged service (LSASS, SYSTEM) into connecting, then
+    # impersonate its token for SYSTEM-level privilege escalation.
+    _LSASS_PIPES = frozenset({r"\lsass", r"\\lsass", "\\lsass"})
+    _SUSPICIOUS_PIPE_DIRS = ("\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
+                             "\\users\\public\\", "\\programdata\\")
+
+    pipe_creates: list[_EvtxEvent] = [
+        ev for ev in by_id.get(17, [])
+        if any(d in ev.fields.get("Image", "").lower() for d in _SUSPICIOUS_PIPE_DIRS)
+        or ev.fields.get("Image", "").lower().startswith("c:\\temp\\")
+    ]
+    pipe_connects_lsass: list[_EvtxEvent] = [
+        ev for ev in by_id.get(18, [])
+        if ev.fields.get("PipeName", "").lower() in _LSASS_PIPES
+        or ev.fields.get("PipeName", "").lower().startswith("\\lsass")
+    ]
+    if pipe_connects_lsass:
+        images = {ev.fields.get("Image", "?") for ev in pipe_connects_lsass}
+        report.add(Finding(
+            rule="evtx.pipe_lsass_connect",
+            severity=Severity.CRITICAL,
+            category="privilege_escalation",
+            message=(
+                f"Named pipe connection to \\lsass detected (Sysmon Event 18): "
+                f"{len(pipe_connects_lsass)} event(s). Token impersonation attack "
+                f"(EfsPotato/PrintSpoofer/JuicyPotato pattern)."
+            ),
+            evidence=tuple(
+                f"PipeName={ev.fields.get('PipeName','?')} Image={ev.fields.get('Image','?')}"
+                for ev in pipe_connects_lsass[:6]
+            ),
+        ))
+    if pipe_creates:
+        images = {ev.fields.get("Image", "?") for ev in pipe_creates}
+        report.add(Finding(
+            rule="evtx.pipe_create_suspicious",
+            severity=Severity.HIGH,
+            category="privilege_escalation",
+            message=(
+                f"Suspicious named pipe created from non-standard path (Sysmon Event 17): "
+                f"{len(pipe_creates)} event(s). Possible token impersonation setup."
+            ),
+            evidence=tuple(
+                f"PipeName={ev.fields.get('PipeName','?')} Image={ev.fields.get('Image','?')}"
+                for ev in pipe_creates[:6]
+            ),
+        ))
+
+    # -----------------------------------------------------------------
+    # 20. Windows Defender — malware detected (Event 1116)
+    # -----------------------------------------------------------------
+    wd_detected = by_id.get(1116, [])
+    wd_remediated = by_id.get(1117, [])
+    if wd_detected:
+        threats = {}
+        for ev in wd_detected:
+            name = ev.fields.get("Threat Name", ev.fields.get("ThreatName", "?"))
+            sev_name = ev.fields.get("Severity Name", ev.fields.get("SeverityName", ""))
+            path = ev.fields.get("Path", ev.fields.get("path", ""))
+            threats[name] = (sev_name, path)
+        severity = Severity.CRITICAL if any(
+            "Severe" in t[0] or "High" in t[0] for t in threats.values()
+        ) else Severity.HIGH
+        report.add(Finding(
+            rule="evtx.defender_threat_detected",
+            severity=severity,
+            category="defence_evasion",
+            message=(
+                f"Windows Defender detected {len(wd_detected)} threat(s) (Event 1116). "
+                f"Unique threat names: {len(threats)}."
+            ),
+            evidence=tuple(
+                f"{name} [{sev}] @ {path[:60]}"
+                for name, (sev, path) in list(threats.items())[:6]
+            ),
+        ))
+    if wd_remediated:
+        threat_names = {
+            ev.fields.get("Threat Name", ev.fields.get("ThreatName", "?"))
+            for ev in wd_remediated
+        }
+        actions = {
+            ev.fields.get("Action Name", ev.fields.get("ActionName", "?"))
+            for ev in wd_remediated
+        }
+        report.add(Finding(
+            rule="evtx.defender_threat_actioned",
+            severity=Severity.HIGH,
+            category="defence_evasion",
+            message=(
+                f"Windows Defender took action against {len(wd_remediated)} threat(s) "
+                f"(Event 1117). Threats: {', '.join(sorted(threat_names))[:120]}"
+            ),
+            evidence=tuple(
+                f"{ev.fields.get('Threat Name', '?')} → "
+                f"{ev.fields.get('Action Name', '?')} on {ev.fields.get('Detection User','?')}"
+                for ev in wd_remediated[:6]
+            ),
+        ))
+
+    # -----------------------------------------------------------------
+    # 21. Sysmon — suspicious network connections (Event 3)
     # -----------------------------------------------------------------
     sysmon_net: list[_EvtxEvent] = by_id.get(3, [])
     rare_port_conns = [
@@ -1444,7 +1687,7 @@ def _detect(events: list[_EvtxEvent], report: AnalyzerReport) -> None:
         ))
 
     # -----------------------------------------------------------------
-    # 20. Firewall disabled (Event 4950 / 4946)
+    # 22. Firewall disabled (Event 4950 / 4946)
     # -----------------------------------------------------------------
     fw_disabled: list[_EvtxEvent] = [
         ev for ev in by_id.get(4950, []) + by_id.get(2004, [])
@@ -1464,7 +1707,7 @@ def _detect(events: list[_EvtxEvent], report: AnalyzerReport) -> None:
         ))
 
     # -----------------------------------------------------------------
-    # 21. Account lockout (Event 4740) — possible brute-force indicator
+    # 23. Account lockout (Event 4740) — possible brute-force indicator
     # -----------------------------------------------------------------
     lockouts = by_id.get(4740, [])
     if len(lockouts) >= 3:
@@ -1481,7 +1724,7 @@ def _detect(events: list[_EvtxEvent], report: AnalyzerReport) -> None:
         ))
 
     # -----------------------------------------------------------------
-    # 22. Password reset (Event 4723/4724)
+    # 24. Password reset (Event 4723/4724)
     # -----------------------------------------------------------------
     pw_resets = by_id.get(4723, []) + by_id.get(4724, [])
     if pw_resets:
@@ -1495,7 +1738,7 @@ def _detect(events: list[_EvtxEvent], report: AnalyzerReport) -> None:
         ))
 
     # -----------------------------------------------------------------
-    # 23. WMI / DCOM lateral movement (Event 4648 + wmic / wmiprvse target)
+    # 25. WMI / DCOM lateral movement (Event 4648 + wmic / wmiprvse target)
     # -----------------------------------------------------------------
     wmi_procs: list[_EvtxEvent] = [
         ev for ev in by_id.get(4688, [])
@@ -1518,7 +1761,7 @@ def _detect(events: list[_EvtxEvent], report: AnalyzerReport) -> None:
         ))
 
     # -----------------------------------------------------------------
-    # 24. Registry persistence (Event 4657 / Sysmon 12/13)
+    # 26. Registry persistence (Event 4657 / Sysmon 12/13)
     # -----------------------------------------------------------------
     reg_run_keys = [
         ev for ev in by_id.get(4657, []) + by_id.get(12, []) + by_id.get(13, [])
@@ -1541,7 +1784,7 @@ def _detect(events: list[_EvtxEvent], report: AnalyzerReport) -> None:
         ))
 
     # -----------------------------------------------------------------
-    # 25. NTLM v1 downgrade / legacy auth (Event 4776 with non-NTLMv2)
+    # 27. NTLM v1 downgrade / legacy auth (Event 4776 with non-NTLMv2)
     # -----------------------------------------------------------------
     ntlm_logons = by_id.get(4776, [])
     if len(ntlm_logons) >= 5:
@@ -1555,6 +1798,39 @@ def _detect(events: list[_EvtxEvent], report: AnalyzerReport) -> None:
                 "Relay / capture opportunity if not restricted."
             ),
             evidence=tuple(users_ntlm)[:6],
+        ))
+
+    # -----------------------------------------------------------------
+    # 28. Sysmon — CreateRemoteThread (Event 8) — code injection
+    # -----------------------------------------------------------------
+    # CreateRemoteThread is rarely legitimate outside debuggers/AV.
+    # Flag when a user-space or system process injects into an unrelated
+    # process, especially across security boundary (SYSTEM → user or vice versa).
+    _INJECTION_WHITELIST_SRC = frozenset({
+        "c:\\windows\\system32\\werfault.exe",
+        "c:\\windows\\system32\\wermgr.exe",
+    })
+    crt_events: list[_EvtxEvent] = [
+        ev for ev in by_id.get(8, [])
+        if ev.fields.get("SourceImage", "").lower() not in _INJECTION_WHITELIST_SRC
+    ]
+    if crt_events:
+        pairs = {
+            (ev.fields.get("SourceImage", "?"), ev.fields.get("TargetImage", "?"))
+            for ev in crt_events
+        }
+        report.add(Finding(
+            rule="evtx.create_remote_thread",
+            severity=Severity.CRITICAL,
+            category="execution",
+            message=(
+                f"CreateRemoteThread detected (Sysmon Event 8): {len(crt_events)} injection(s). "
+                "Strong indicator of code injection / process hollowing / UAC bypass."
+            ),
+            evidence=tuple(
+                f"{src!r:.40} → {tgt!r:.40}"
+                for src, tgt in list(pairs)[:6]
+            ),
         ))
 
 
@@ -1727,12 +2003,12 @@ def analyze_evtx(raw: bytes, *, report: AnalyzerReport) -> None:
         # Per-chunk template cache (templates are chunk-local by offset)
         chunk_tmpl_cache: dict[int, _TemplateInfo] = {}
 
-        for record_id, filetime, binxml in _iter_chunk_records(chunk):
+        for record_id, filetime, binxml, binxml_start in _iter_chunk_records(chunk):
             if len(events) >= _MAX_RECORDS:
                 break
             try:
                 ev = _decode_record(
-                    record_id, filetime, binxml, chunk, chunk_tmpl_cache
+                    record_id, filetime, binxml, chunk, chunk_tmpl_cache, binxml_start
                 )
                 events.append(ev)
             except Exception:

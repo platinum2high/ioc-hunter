@@ -122,9 +122,10 @@ class _BinXmlBuilder:
             off_in_names = len(self._name_data)
             self._name_cache[name] = tok_size + off_in_names
             enc = name.encode("utf-16-le")
-            # name layout: next_offset(4) + hash(4) + length(2) + unknown(2) + chars
-            self._name_data.extend(struct.pack("<IIHH", 0, 0, len(name), 0))
+            # name layout (NameStringNode): next_off(4) + hash(2) + length(2) + chars + null(2)
+            self._name_data.extend(struct.pack("<IHH", 0, 0, len(name)))
             self._name_data.extend(enc)
+            self._name_data.extend(b"\x00\x00")
 
         # Patch slots in token stream
         for slot_pos, name in self._patches:
