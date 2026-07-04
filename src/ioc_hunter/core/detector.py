@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import re
 
+from ioc_hunter.core._tlds import IANA_TLDS
 from ioc_hunter.core.types import IOCType
 
 _BASE58_MAP: dict[int, int] = {
@@ -80,7 +81,7 @@ def detect_type(value: str) -> IOCType | None:
     except ValueError:
         pass
 
-    if _DOMAIN_RE.match(s):
+    if _DOMAIN_RE.match(s) and s.rsplit(".", 1)[-1].lower() in IANA_TLDS:
         return IOCType.DOMAIN
 
     return None

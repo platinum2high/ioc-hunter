@@ -93,7 +93,7 @@ async def test_drain_batches_debounces() -> None:
     """A burst of lines should land in a single batch after the debounce."""
 
     async def feed() -> AsyncIterator[str]:
-        yield "evil.example sent traffic to 1.2.3.4"
+        yield "evil.net sent traffic to 1.2.3.4"
         yield "and again from 5.6.7.8"
         # Long sleep simulates "quiet" — debounce should fire.
         await asyncio.sleep(0.0)
@@ -112,7 +112,7 @@ async def test_drain_batches_debounces() -> None:
     values = {ioc.value for ioc in batches[0]}
     assert "1.2.3.4" in values
     assert "5.6.7.8" in values
-    assert "evil.example" in values
+    assert "evil.net" in values
 
 
 @pytest.mark.asyncio

@@ -157,16 +157,16 @@ def test_icmp_tunnel_signal_fires_end_to_end():
 
 
 def test_iocs_include_dns_and_tls_extracted_names():
-    ch = synth_tls_clienthello(sni="exfil.attacker.tld")
+    ch = synth_tls_clienthello(sni="exfil.attacker.com")
     frames = [
-        (1.0, eth_ipv4_udp("10.0.0.5", "8.8.8.8", 50000, 53, dns_query("c2.attacker.tld"))),
+        (1.0, eth_ipv4_udp("10.0.0.5", "8.8.8.8", 50000, 53, dns_query("c2.attacker.com"))),
         (1.1, eth_ipv4_tcp("10.0.0.5", "203.0.113.10", 50000, 443, payload=ch)),
     ]
     raw = build_pcap(frames)
     report = analyze(_write_pcap(raw))
     ioc_values = {ioc.value for ioc in report.iocs}
-    assert "c2.attacker.tld" in ioc_values
-    assert "exfil.attacker.tld" in ioc_values
+    assert "c2.attacker.com" in ioc_values
+    assert "exfil.attacker.com" in ioc_values
 
 
 def test_markdown_renderer_handles_pcap_report():

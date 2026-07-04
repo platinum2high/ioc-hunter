@@ -122,16 +122,16 @@ class TestStringExtraction:
 class TestSweepIocs:
     def test_extracts_url_and_ip(self):
         strs = [
-            "https://malicious.example/loader.bin",
+            "https://malicious.net/loader.bin",
             "C2 IP is 198.51.100.42",
             "garbage with no IOC here",
         ]
         iocs = sweep_iocs(strs)
         values = {(i.type, i.value) for i in iocs}
-        assert (IOCType.URL, "https://malicious.example/loader.bin") in values
+        assert (IOCType.URL, "https://malicious.net/loader.bin") in values
         assert (IOCType.IPV4, "198.51.100.42") in values
         # Host of the URL is surfaced too.
-        assert (IOCType.DOMAIN, "malicious.example") in values
+        assert (IOCType.DOMAIN, "malicious.net") in values
 
     def test_empty_input(self):
         assert sweep_iocs([]) == []

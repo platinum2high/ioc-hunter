@@ -98,6 +98,19 @@ def test_iocs_are_hashable_for_dedup() -> None:
     assert len(set(iocs)) == len(iocs)
 
 
+def test_filename_extensions_not_extracted_as_domains() -> None:
+    """Common attachment filenames must not produce false-positive domain IOCs."""
+    text = (
+        "Attachments: malware.exe report.docx readme.txt invoice.pdf "
+        "config.ini backup.zip image.png script.ps1 archive.tar"
+    )
+    iocs = extract_iocs(text)
+    domain_values = {ioc.value for ioc in iocs if ioc.type == IOCType.DOMAIN}
+    for fake in ("malware.exe", "report.docx", "readme.txt", "invoice.pdf",
+                 "config.ini", "image.png", "script.ps1", "archive.tar"):
+        assert fake not in domain_values, f"{fake!r} should not be extracted as a domain"
+
+
 def test_btc_invalid_checksum_not_extracted() -> None:
     """Base58-looking tokens that fail checksum must be silently dropped."""
     text = (

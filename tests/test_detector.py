@@ -51,10 +51,29 @@ def test_detect_positive(value: str, expected: IOCType) -> None:
         "evil.x",  # 1-char TLD
         "1234567890abcdef",  # 16 hex — not a hash
         "CVE-99-1",  # malformed CVE year
+        "malware.exe",  # file extension, not a TLD
+        "report.docx",
+        "readme.txt",
+        "invoice.pdf",
+        "config.ini",
+        "image.png",
     ],
 )
 def test_detect_negative(value: str) -> None:
     assert detect_type(value) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_type"),
+    [
+        ("evil.com", IOCType.DOMAIN),
+        ("sub.evil.co.uk", IOCType.DOMAIN),
+        ("evil.net", IOCType.DOMAIN),
+        ("phish.io", IOCType.DOMAIN),
+    ],
+)
+def test_domain_tld_validation_accepts_real_tlds(value: str, expected_type: IOCType) -> None:
+    assert detect_type(value) == expected_type
 
 
 @pytest.mark.parametrize(

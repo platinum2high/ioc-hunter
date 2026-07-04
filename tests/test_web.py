@@ -27,7 +27,7 @@ class _FakeEngine:
         self._fixture: dict[str, Verdict] = {
             "1.2.3.4": Verdict.MALICIOUS,
             "10.0.0.5": Verdict.BENIGN,
-            "evil.example": Verdict.MALICIOUS,
+            "evil.net": Verdict.MALICIOUS,
         }
 
     async def lookup_one(self, ioc: IOC) -> IOCVerdict:
@@ -145,14 +145,14 @@ async def test_check_value_too_long(client: httpx.AsyncClient) -> None:
 async def test_scan_extracts_and_enriches(client: httpx.AsyncClient) -> None:
     resp = await client.post(
         "/api/scan",
-        json={"text": "found 1.2.3.4 talking to evil.example, and 10.0.0.5 too"},
+        json={"text": "found 1.2.3.4 talking to evil.net, and 10.0.0.5 too"},
     )
     assert resp.status_code == 200
     data = resp.json()
     assert data["iocs_extracted"] >= 3
     values = {v["ioc"]["raw_value"] for v in data["verdicts"]}
     assert "1.2.3.4" in values
-    assert "evil.example" in values
+    assert "evil.net" in values
 
 
 @pytest.mark.asyncio
@@ -476,7 +476,7 @@ async def test_byok_scan_path(app_with_fake_engine: FastAPI, mocked_ti_endpoints
         r = await c.post(
             "/api/scan",
             json={
-                "text": "found 1.2.3.4 talking to evil.example",
+                "text": "found 1.2.3.4 talking to evil.net",
                 "keys": {"otx_api_key": "otx-fake-token"},
             },
         )

@@ -20,6 +20,7 @@ import ipaddress
 import re
 from urllib.parse import urlparse
 
+from ioc_hunter.core._tlds import IANA_TLDS
 from ioc_hunter.core.defang import refang
 from ioc_hunter.core.detector import _btc_legacy_checksum_valid, detect_type
 from ioc_hunter.core.types import IOC, IOCType
@@ -157,10 +158,13 @@ def extract_iocs(
             mark(*m.span())
             add(m.group(), IOCType.IPV4)
 
-    # 8. Bare domains.
+    # 8. Bare domains — reject if the final label is not a real IANA TLD.
     for m in _DOMAIN_SCAN.finditer(text):
+        val = m.group()
+        if val.rsplit(".", 1)[-1].lower() not in IANA_TLDS:
+            continue
         if is_free(*m.span()):
             mark(*m.span())
-            add(m.group(), IOCType.DOMAIN, raw=m.group())
+            add(val, IOCType.DOMAIN, raw=val)
 
     return found
