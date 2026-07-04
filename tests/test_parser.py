@@ -96,3 +96,16 @@ def test_full_incident_text() -> None:
 def test_iocs_are_hashable_for_dedup() -> None:
     iocs = extract_iocs("evil.com evil.com")
     assert len(set(iocs)) == len(iocs)
+
+
+def test_btc_invalid_checksum_not_extracted() -> None:
+    """Base58-looking tokens that fail checksum must be silently dropped."""
+    text = (
+        "Incident artifacts: 1JS95cPZqKKmDKapZuxbaSuh7HKw7Y "
+        "1aupYQ21YKaNUP2CPmKit1hqswspQ7 and real addr 1BoatSLRHtKNngkdXEeobR76b53LETtpyT"
+    )
+    iocs = extract_iocs(text)
+    values = {ioc.value for ioc in iocs}
+    assert "1BoatSLRHtKNngkdXEeobR76b53LETtpyT" in values
+    assert "1JS95cPZqKKmDKapZuxbaSuh7HKw7Y" not in values
+    assert "1aupYQ21YKaNUP2CPmKit1hqswspQ7" not in values

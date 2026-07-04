@@ -21,7 +21,7 @@ import re
 from urllib.parse import urlparse
 
 from ioc_hunter.core.defang import refang
-from ioc_hunter.core.detector import detect_type
+from ioc_hunter.core.detector import _btc_legacy_checksum_valid, detect_type
 from ioc_hunter.core.types import IOC, IOCType
 
 _URL_SCAN = re.compile(r"\b(?:https?|ftps?)://[^\s<>\"'\[\]{}|\\^`]+", re.IGNORECASE)
@@ -131,11 +131,14 @@ def extract_iocs(
             add(m.group().upper(), IOCType.CVE)
 
     # 5. BTC (bech32 first, then legacy — legacy is more permissive).
-    for scan in (_BTC_BECH32_SCAN, _BTC_LEGACY_SCAN):
-        for m in scan.finditer(text):
-            if is_free(*m.span()):
-                mark(*m.span())
-                add(m.group(), IOCType.BTC_ADDRESS)
+    for m in _BTC_BECH32_SCAN.finditer(text):
+        if is_free(*m.span()):
+            mark(*m.span())
+            add(m.group(), IOCType.BTC_ADDRESS)
+    for m in _BTC_LEGACY_SCAN.finditer(text):
+        if is_free(*m.span()) and _btc_legacy_checksum_valid(m.group()):
+            mark(*m.span())
+            add(m.group(), IOCType.BTC_ADDRESS)
 
     # 6. IPv6 (validate via stdlib, regex is loose).
     for m in _IPV6_SCAN.finditer(text):

@@ -2,10 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import re
 
 from ioc_hunter.core.types import IOCType
+
+_BASE58_MAP: dict[int, int] = {
+    c: i
+    for i, c in enumerate(b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+}
+
+
+def _btc_legacy_checksum_valid(s: str) -> bool:
+    """Return True iff s is a structurally valid Base58Check legacy BTC address.
+
+    Decodes to exactly 25 bytes and verifies that the final 4 bytes equal
+    the first 4 bytes of SHA256(SHA256(payload)).
+    """
+    try:
+        n = 0
+        for byte in s.encode():
+            n = n * 58 + _BASE58_MAP[byte]
+        raw = n.to_bytes(25, "big")
+    except (KeyError, OverflowError):
+        return False
+    return hashlib.sha256(hashlib.sha256(raw[:-4]).digest()).digest()[:4] == raw[-4:]
 
 _SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 _SHA1_RE = re.compile(r"^[a-fA-F0-9]{40}$")
@@ -43,7 +65,7 @@ def detect_type(value: str) -> IOCType | None:
 
     if _BTC_BECH32_RE.match(s.lower()) and s.lower().startswith("bc1"):
         return IOCType.BTC_ADDRESS
-    if _BTC_LEGACY_RE.match(s):
+    if _BTC_LEGACY_RE.match(s) and _btc_legacy_checksum_valid(s):
         return IOCType.BTC_ADDRESS
 
     if _URL_RE.match(s):
