@@ -222,8 +222,7 @@ async def test_security_headers_present(client: httpx.AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_x_forwarded_for_used_for_rate_limit(app_with_fake_engine: FastAPI) -> None:
-    """A client sending a spoofed XFF header should be bucketed by the
-    leftmost value, not by request.client.host."""
+    """Rate-limit bucket is derived from the rightmost XFF entry (proxy-added)."""
     app_with_fake_engine.state.limiter = RateLimiter(max_requests=2, window_seconds=60)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app_with_fake_engine), base_url="http://t"
@@ -249,6 +248,31 @@ async def test_x_forwarded_for_used_for_rate_limit(app_with_fake_engine: FastAPI
             headers={"X-Forwarded-For": "user-b"},
         )
         assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_xff_spoofing_cannot_bypass_rate_limit(app_with_fake_engine: FastAPI) -> None:
+    """A client rotating fake leftmost XFF entries must still be rate-limited
+    by the rightmost (proxy-appended) entry."""
+    app_with_fake_engine.state.limiter = RateLimiter(max_requests=2, window_seconds=60)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_with_fake_engine), base_url="http://t"
+    ) as c:
+        # Attacker rotates the leftmost entry but real IP (rightmost) stays constant.
+        for fake_prefix in ("10.0.0.1", "10.0.0.2"):
+            resp = await c.post(
+                "/api/check",
+                json={"value": "1.2.3.4"},
+                headers={"X-Forwarded-For": f"{fake_prefix}, real-client-ip"},
+            )
+            assert resp.status_code == 200
+        # Third request from the same real IP must be blocked.
+        resp = await c.post(
+            "/api/check",
+            json={"value": "1.2.3.4"},
+            headers={"X-Forwarded-For": "10.0.0.3, real-client-ip"},
+        )
+        assert resp.status_code == 429
 
 
 def test_rate_limiter_basic() -> None:

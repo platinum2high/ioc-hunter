@@ -203,15 +203,15 @@ async def _run_byok_lookup(
 def _client_ip(request: Request) -> str:
     """Best-effort client IP for rate-limit bucketing.
 
-    Render terminates TLS at its edge and forwards the real client IP
-    in X-Forwarded-For. Trust only the *first* (leftmost) entry — the
-    rest can be spoofed by the client.
+    Render terminates TLS at its edge and *appends* the real client IP
+    to X-Forwarded-For. Leftmost entries are client-controlled and must
+    not be trusted; the rightmost entry is the one the trusted proxy added.
     """
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first
+        last = forwarded.split(",")[-1].strip()
+        if last:
+            return last
     if request.client is not None:
         return request.client.host
     return "unknown"
