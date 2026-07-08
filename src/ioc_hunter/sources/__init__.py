@@ -6,6 +6,7 @@ together by the async orchestrator in `engine.py`.
 
 from ioc_hunter.sources.abuseipdb import AbuseIPDBSource
 from ioc_hunter.sources.base import Source, SourceResult, Verdict
+from ioc_hunter.sources.misp import MISPSource
 from ioc_hunter.sources.netmeta import NetMetaSource
 from ioc_hunter.sources.otx import OTXSource
 from ioc_hunter.sources.threatfox import ThreatFoxSource
@@ -15,6 +16,7 @@ from ioc_hunter.sources.virustotal import VirusTotalSource
 
 __all__ = [
     "AbuseIPDBSource",
+    "MISPSource",
     "NetMetaSource",
     "OTXSource",
     "Source",

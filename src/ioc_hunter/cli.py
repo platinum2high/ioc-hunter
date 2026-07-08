@@ -48,8 +48,10 @@ from ioc_hunter.engine import Engine
 from ioc_hunter.exporters import to_json, to_markdown, to_misp, to_stix
 from ioc_hunter.rules import to_sigma, to_suricata
 from ioc_hunter.scorer import IOCVerdict
+from ioc_hunter.misp_publisher import MISPPublishError, MISPPublisher
 from ioc_hunter.sources import (
     AbuseIPDBSource,
+    MISPSource,
     NetMetaSource,
     OTXSource,
     Source,
@@ -84,10 +86,15 @@ _VERDICT_STYLES: dict[Verdict, tuple[str, str]] = {
 }
 
 
-def _build_sources(client: httpx.AsyncClient, settings: Settings) -> list[Source]:
+def _build_sources(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    *,
+    misp_client: httpx.AsyncClient | None = None,
+) -> list[Source]:
     """Instantiate every source. Sources without a key stay registered but
     will short-circuit to UNKNOWN with an error explaining why."""
-    return [
+    sources: list[Source] = [
         NetMetaSource(client),
         TorExitSource(client),
         URLhausSource(client, api_key=settings.abuse_ch_auth_key),
@@ -95,16 +102,24 @@ def _build_sources(client: httpx.AsyncClient, settings: Settings) -> list[Source
         AbuseIPDBSource(client, api_key=settings.abuseipdb_api_key),
         OTXSource(client, api_key=settings.otx_api_key),
         VirusTotalSource(client, api_key=settings.virustotal_api_key),
+        MISPSource(
+            misp_client or client,
+            api_key=settings.misp_key,
+            misp_url=settings.misp_url or "",
+        ),
     ]
+    return sources
 
 
 def _build_engine(
     client: httpx.AsyncClient,
     settings: Settings,
     cache: TICache | None,
+    *,
+    misp_client: httpx.AsyncClient | None = None,
 ) -> Engine:
     return Engine(
-        _build_sources(client, settings),
+        _build_sources(client, settings, misp_client=misp_client),
         cache=cache,
         max_concurrency=settings.max_concurrency,
     )
@@ -201,7 +216,12 @@ def _render_batch_table(verdicts: list[IOCVerdict]) -> None:
     console.print(table)
 
 
-async def _run_check(value: str, type_hint: str | None, use_cache: bool) -> int:
+async def _run_check(
+    value: str,
+    type_hint: str | None,
+    use_cache: bool,
+    push_misp: bool,
+) -> int:
     ioc = _parse_ioc(value, type_hint)
     if ioc is None:
         console.print(f"[red]Could not detect IOC type for:[/] {value}")
@@ -211,14 +231,36 @@ async def _run_check(value: str, type_hint: str | None, use_cache: bool) -> int:
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
+        verify = settings.misp_verify_ssl
         async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
-            active = engine.active_sources
-            if not active:
-                console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
-                return 2
-            with console.status(f"Querying {len(active)} source(s) for {_safe(ioc.value)}..."):
-                verdict = await engine.lookup_one(ioc)
+            async with httpx.AsyncClient(verify=verify) as misp_client:
+                engine = _build_engine(client, settings, cache, misp_client=misp_client)
+                active = engine.active_sources
+                if not active:
+                    console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
+                    return 2
+                with console.status(f"Querying {len(active)} source(s) for {_safe(ioc.value)}..."):
+                    verdict = await engine.lookup_one(ioc)
+
+                if push_misp:
+                    if not settings.misp_url or not settings.misp_key:
+                        console.print("[red]--push-misp requires MISP_URL and MISP_KEY — run `ioc-hunter configure`.[/]")
+                        return 2
+                    if verdict.verdict not in {Verdict.MALICIOUS, Verdict.SUSPICIOUS}:
+                        console.print("[yellow]Verdict is not malicious/suspicious — skipping MISP push.[/]")
+                    else:
+                        publisher = MISPPublisher(
+                            settings.misp_url,
+                            settings.misp_key,
+                            client=misp_client,
+                        )
+                        with console.status("Pushing to MISP..."):
+                            try:
+                                uuid = await publisher.push([verdict])
+                                console.print(f"[green]Pushed to MISP:[/] event UUID [bold]{uuid}[/]")
+                            except MISPPublishError as exc:
+                                console.print(f"[red]MISP push failed:[/] {exc}")
+                                return 3
     finally:
         if cache is not None:
             cache.close()
@@ -263,8 +305,11 @@ def check(
         None, "--type", "-t", help="Override auto-detection (ipv4, domain, ...)."
     ),
     no_cache: bool = typer.Option(False, "--no-cache", help="Skip the SQLite cache."),
+    push_misp: bool = typer.Option(
+        False, "--push-misp", help="Push malicious/suspicious result to configured MISP instance."
+    ),
 ) -> None:
-    exit_code = asyncio.run(_run_check(ioc, type_hint, use_cache=not no_cache))
+    exit_code = asyncio.run(_run_check(ioc, type_hint, use_cache=not no_cache, push_misp=push_misp))
     raise typer.Exit(exit_code)
 
 
@@ -1274,6 +1319,7 @@ async def _run_report(
     fmt: str,
     out: Path | None,
     use_cache: bool,
+    push_misp: bool,
 ) -> int:
     if fmt not in _EXPORTERS:
         choices = ", ".join(sorted(set(_EXPORTERS)))
@@ -1288,13 +1334,32 @@ async def _run_report(
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
+        verify = settings.misp_verify_ssl
         async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
-            if not engine.active_sources:
-                console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
-                return 2
-            with console.status(f"Enriching {len(iocs)} IOC(s) for {fmt} report..."):
-                verdicts = await engine.lookup_many(iocs)
+            async with httpx.AsyncClient(verify=verify) as misp_client:
+                engine = _build_engine(client, settings, cache, misp_client=misp_client)
+                if not engine.active_sources:
+                    console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
+                    return 2
+                with console.status(f"Enriching {len(iocs)} IOC(s) for {fmt} report..."):
+                    verdicts = await engine.lookup_many(iocs)
+
+                if push_misp:
+                    if not settings.misp_url or not settings.misp_key:
+                        console.print("[red]--push-misp requires MISP_URL and MISP_KEY — run `ioc-hunter configure`.[/]")
+                        return 2
+                    publisher = MISPPublisher(
+                        settings.misp_url,
+                        settings.misp_key,
+                        client=misp_client,
+                    )
+                    with console.status("Pushing to MISP..."):
+                        try:
+                            uuid = await publisher.push(verdicts)
+                            console.print(f"[green]Pushed to MISP:[/] event UUID [bold]{uuid}[/]")
+                        except MISPPublishError as exc:
+                            console.print(f"[red]MISP push failed:[/] {exc}")
+                            return 3
     finally:
         if cache is not None:
             cache.close()
@@ -1319,8 +1384,11 @@ def report(
     ),
     out: Path | None = typer.Option(None, "--out", "-o", help="Write to file instead of stdout."),
     no_cache: bool = typer.Option(False, "--no-cache", help="Skip the SQLite cache."),
+    push_misp: bool = typer.Option(
+        False, "--push-misp", help="Push enriched results to configured MISP instance."
+    ),
 ) -> None:
-    exit_code = asyncio.run(_run_report(path, fmt, out, use_cache=not no_cache))
+    exit_code = asyncio.run(_run_report(path, fmt, out, use_cache=not no_cache, push_misp=push_misp))
     raise typer.Exit(exit_code)
 
 
@@ -1461,6 +1529,9 @@ _CONFIGURABLE = (
         "https://www.virustotal.com/",
     ),
     ("SHODAN_API_KEY", "Shodan (optional)", "https://account.shodan.io/"),
+    ("MISP_URL", "MISP instance URL (optional, e.g. https://misp.internal)", ""),
+    ("MISP_KEY", "MISP API key (optional)", ""),
+    ("MISP_VERIFY_SSL", "MISP SSL verify (true/false, default: true)", ""),
 )
 
 

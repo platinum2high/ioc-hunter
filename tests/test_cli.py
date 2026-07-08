@@ -235,8 +235,8 @@ def test_correlate_command(patch_engine, tmp_path: Path) -> None:
 
 def test_configure_writes_env(tmp_path: Path) -> None:
     target = tmp_path / "fresh.env"
-    # Provide answers for each prompt: abuse_ch, abuseipdb, otx, virustotal, shodan
-    answers = "newkey1\n\nnewotx\n\n\n"
+    # Provide answers for each prompt: abuse_ch, abuseipdb, otx, virustotal, shodan, misp_url, misp_key, misp_verify_ssl
+    answers = "newkey1\n\nnewotx\n\n\n\n\n\n"
     result = runner.invoke(
         cli.app,
         ["configure", "--env-path", str(target)],
