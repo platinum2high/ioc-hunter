@@ -275,7 +275,7 @@ async def _run_check(
                     with console.status("Pushing to MISP..."):
                         try:
                             uuid = await publisher.push([verdict])
-                            console.print(f"[green]Pushed to MISP:[/] event UUID [bold]{uuid}[/]")
+                            console.print(f"[green]Pushed to MISP:[/] [bold]{uuid}[/]")
                         except MISPPublishError as exc:
                             console.print(f"[red]MISP push failed:[/] {exc}")
                             return 3
@@ -1375,7 +1375,7 @@ async def _run_report(
                 with console.status("Pushing to MISP..."):
                     try:
                         uuid = await publisher.push(verdicts)
-                        console.print(f"[green]Pushed to MISP:[/] event UUID [bold]{uuid}[/]")
+                        console.print(f"[green]Pushed to MISP:[/] [bold]{uuid}[/]")
                     except MISPPublishError as exc:
                         console.print(f"[red]MISP push failed:[/] {exc}")
                         return 3
