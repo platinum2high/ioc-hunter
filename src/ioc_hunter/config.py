@@ -48,7 +48,7 @@ def _bool(name: str, default: bool = True) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
-    return raw.strip().lower() not in {"0", "false", "no"}
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 @dataclass(frozen=True, slots=True)

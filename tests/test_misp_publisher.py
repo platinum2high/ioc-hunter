@@ -9,7 +9,7 @@ import pytest
 import respx
 
 from ioc_hunter.core.types import IOC, IOCType
-from ioc_hunter.misp_publisher import MISPPublishError, MISPPublisher
+from ioc_hunter.misp_publisher import MISPPublisher, MISPPublishError
 from ioc_hunter.scorer import IOCVerdict
 from ioc_hunter.sources.base import Verdict
 

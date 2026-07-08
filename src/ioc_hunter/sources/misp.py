@@ -7,6 +7,7 @@ Accept: application/json
 
 from __future__ import annotations
 
+import contextlib
 import time
 from typing import Any
 
@@ -53,6 +54,8 @@ class MISPSource(Source):
         if not self.supports(ioc_type):
             return self._unsupported(ioc_type, ioc_value)
         if not self.is_configured:
+            if not self._misp_url:
+                return self._error(ioc_type, ioc_value, "misp is not configured (missing MISP_URL)")
             return self._missing_key(ioc_type, ioc_value)
 
         url = self._misp_url + _SEARCH_PATH
@@ -107,7 +110,12 @@ class MISPSource(Source):
                 if name and name not in tags:
                     tags.append(name)
 
-        timestamps = [int(a["timestamp"]) for a in attributes if a.get("timestamp")]
+        timestamps: list[int] = []
+        for a in attributes:
+            raw_ts = a.get("timestamp")
+            if raw_ts is not None:
+                with contextlib.suppress(ValueError, TypeError):
+                    timestamps.append(int(raw_ts))
         first_seen = (
             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(min(timestamps)))
             if timestamps

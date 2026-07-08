@@ -16,6 +16,8 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -46,9 +48,9 @@ from ioc_hunter.decoder import decode as _decode_op
 from ioc_hunter.decoder import magic as _magic
 from ioc_hunter.engine import Engine
 from ioc_hunter.exporters import to_json, to_markdown, to_misp, to_stix
+from ioc_hunter.misp_publisher import MISPPublisher, MISPPublishError
 from ioc_hunter.rules import to_sigma, to_suricata
 from ioc_hunter.scorer import IOCVerdict
-from ioc_hunter.misp_publisher import MISPPublishError, MISPPublisher
 from ioc_hunter.sources import (
     AbuseIPDBSource,
     MISPSource,
@@ -129,6 +131,18 @@ def _open_cache(settings: Settings, enabled: bool) -> TICache | None:
     if not enabled:
         return None
     return TICache(settings.cache_dir / "ioc_hunter.db", default_ttl=settings.cache_ttl)
+
+
+@asynccontextmanager
+async def _misp_client(settings: Settings) -> AsyncIterator[httpx.AsyncClient | None]:
+    """Yield a dedicated AsyncClient for MISP (respecting MISP_VERIFY_SSL) when
+    MISP is configured, or None otherwise — so callers never create a wasted
+    connection pool when MISP is not set up."""
+    if settings.misp_url and settings.misp_key:
+        async with httpx.AsyncClient(verify=settings.misp_verify_ssl) as client:
+            yield client
+    else:
+        yield None
 
 
 def _parse_ioc(value: str, type_hint: str | None) -> IOC | None:
@@ -231,43 +245,41 @@ async def _run_check(
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        verify = settings.misp_verify_ssl
-        async with httpx.AsyncClient() as client:
-            async with httpx.AsyncClient(verify=verify) as misp_client:
-                engine = _build_engine(client, settings, cache, misp_client=misp_client)
-                active = engine.active_sources
-                if not active:
-                    console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
-                    return 2
-                with console.status(f"Querying {len(active)} source(s) for {_safe(ioc.value)}..."):
-                    verdict = await engine.lookup_one(ioc)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
+            active = engine.active_sources
+            if not active:
+                console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
+                return 2
+            with console.status(f"Querying {len(active)} source(s) for {_safe(ioc.value)}..."):
+                verdict = await engine.lookup_one(ioc)
 
-                if push_misp:
-                    if not settings.misp_url or not settings.misp_key:
-                        console.print("[red]--push-misp requires MISP_URL and MISP_KEY — run `ioc-hunter configure`.[/]")
-                        return 2
-                    if verdict.verdict not in {Verdict.MALICIOUS, Verdict.SUSPICIOUS}:
-                        console.print("[yellow]Verdict is not malicious/suspicious — skipping MISP push.[/]")
-                    else:
-                        publisher = MISPPublisher(
-                            settings.misp_url,
-                            settings.misp_key,
-                            client=misp_client,
-                        )
-                        with console.status("Pushing to MISP..."):
-                            try:
-                                uuid = await publisher.push([verdict])
-                                console.print(f"[green]Pushed to MISP:[/] event UUID [bold]{uuid}[/]")
-                            except MISPPublishError as exc:
-                                console.print(f"[red]MISP push failed:[/] {exc}")
-                                return 3
+            _render_verdict_panel(verdict)
+            _render_per_source_table(verdict)
+            _render_extras(verdict)
+
+            if push_misp:
+                if not settings.misp_url or not settings.misp_key:
+                    console.print("[red]--push-misp requires MISP_URL and MISP_KEY — run `ioc-hunter configure`.[/]")
+                    return 2
+                if verdict.verdict not in {Verdict.MALICIOUS, Verdict.SUSPICIOUS}:
+                    console.print("[yellow]Verdict is not malicious/suspicious — skipping MISP push.[/]")
+                else:
+                    publisher = MISPPublisher(
+                        settings.misp_url,
+                        settings.misp_key,
+                        client=mc or client,
+                    )
+                    with console.status("Pushing to MISP..."):
+                        try:
+                            uuid = await publisher.push([verdict])
+                            console.print(f"[green]Pushed to MISP:[/] event UUID [bold]{uuid}[/]")
+                        except MISPPublishError as exc:
+                            console.print(f"[red]MISP push failed:[/] {exc}")
+                            return 3
     finally:
         if cache is not None:
             cache.close()
-
-    _render_verdict_panel(verdict)
-    _render_per_source_table(verdict)
-    _render_extras(verdict)
     return 0
 
 
@@ -282,8 +294,8 @@ async def _run_scan_file(path: Path, use_cache: bool) -> int:
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             active = engine.active_sources
             if not active:
                 console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
@@ -401,8 +413,8 @@ async def _run_parse_eml(path: Path, enrich: bool, use_cache: bool) -> int:
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             active = engine.active_sources
             if not active:
                 console.print("[yellow]No active TI sources — run `ioc-hunter configure`.[/]")
@@ -1144,8 +1156,8 @@ async def _run_analyze(
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             if not engine.active_sources:
                 console.print(
                     "\n[yellow]No active TI sources — skipping IOC enrichment.[/]  "
@@ -1169,8 +1181,8 @@ async def _enrich_for_json(iocs, *, use_cache: bool):
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             if not engine.active_sources:
                 return []
             return await engine.lookup_many(iocs)
@@ -1253,8 +1265,8 @@ async def _run_watch(
         )
     )
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             if not engine.active_sources:
                 console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
                 return 2
@@ -1334,42 +1346,40 @@ async def _run_report(
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        verify = settings.misp_verify_ssl
-        async with httpx.AsyncClient() as client:
-            async with httpx.AsyncClient(verify=verify) as misp_client:
-                engine = _build_engine(client, settings, cache, misp_client=misp_client)
-                if not engine.active_sources:
-                    console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
-                    return 2
-                with console.status(f"Enriching {len(iocs)} IOC(s) for {fmt} report..."):
-                    verdicts = await engine.lookup_many(iocs)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
+            if not engine.active_sources:
+                console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
+                return 2
+            with console.status(f"Enriching {len(iocs)} IOC(s) for {fmt} report..."):
+                verdicts = await engine.lookup_many(iocs)
 
-                if push_misp:
-                    if not settings.misp_url or not settings.misp_key:
-                        console.print("[red]--push-misp requires MISP_URL and MISP_KEY — run `ioc-hunter configure`.[/]")
-                        return 2
-                    publisher = MISPPublisher(
-                        settings.misp_url,
-                        settings.misp_key,
-                        client=misp_client,
-                    )
-                    with console.status("Pushing to MISP..."):
-                        try:
-                            uuid = await publisher.push(verdicts)
-                            console.print(f"[green]Pushed to MISP:[/] event UUID [bold]{uuid}[/]")
-                        except MISPPublishError as exc:
-                            console.print(f"[red]MISP push failed:[/] {exc}")
-                            return 3
+            rendered = _EXPORTERS[fmt](verdicts)
+            if out is None:
+                print(rendered)
+            else:
+                out.write_text(rendered)
+                console.print(f"[green]Wrote[/] {out} ({len(rendered)} bytes)")
+
+            if push_misp:
+                if not settings.misp_url or not settings.misp_key:
+                    console.print("[red]--push-misp requires MISP_URL and MISP_KEY — run `ioc-hunter configure`.[/]")
+                    return 2
+                publisher = MISPPublisher(
+                    settings.misp_url,
+                    settings.misp_key,
+                    client=mc or client,
+                )
+                with console.status("Pushing to MISP..."):
+                    try:
+                        uuid = await publisher.push(verdicts)
+                        console.print(f"[green]Pushed to MISP:[/] event UUID [bold]{uuid}[/]")
+                    except MISPPublishError as exc:
+                        console.print(f"[red]MISP push failed:[/] {exc}")
+                        return 3
     finally:
         if cache is not None:
             cache.close()
-
-    rendered = _EXPORTERS[fmt](verdicts)
-    if out is None:
-        print(rendered)
-    else:
-        out.write_text(rendered)
-        console.print(f"[green]Wrote[/] {out} ({len(rendered)} bytes)")
     return 0
 
 
@@ -1402,8 +1412,8 @@ async def _run_correlate(path: Path, use_cache: bool) -> int:
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             if not engine.active_sources:
                 console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
                 return 2

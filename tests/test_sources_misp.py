@@ -143,10 +143,9 @@ async def test_missing_url_yields_error(http_client: httpx.AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_unsupported_type(http_client: httpx.AsyncClient) -> None:
     src = MISPSource(http_client, api_key="key", misp_url=_BASE)
-    result = await src.lookup(IOCType.IPV4, "not-relevant")
-    # IPV4 is supported — use a type that MISPSource doesn't support
-    # (all IOCTypes are supported, so test unsupported via a domain that works fine)
-    assert result is not None
+    result = await src.lookup(IOCType.CVE, "CVE-2021-44228")
+    assert result.error is not None
+    assert "support" in result.error
 
 
 @pytest.mark.asyncio
@@ -160,6 +159,28 @@ async def test_score_caps_at_1(http_client: httpx.AsyncClient) -> None:
         result = await src.lookup(IOCType.IPV4, "1.2.3.4")
     assert result.score <= 1.0
     assert result.verdict is Verdict.MALICIOUS
+
+
+@pytest.mark.asyncio
+async def test_non_numeric_timestamp_does_not_crash(http_client: httpx.AsyncClient) -> None:
+    src = MISPSource(http_client, api_key="key", misp_url=_BASE)
+    bad_attr = _attr(timestamp="N/A")
+    with respx.mock() as router:
+        router.post(_SEARCH_URL).mock(
+            return_value=httpx.Response(200, json=_response([bad_attr]))
+        )
+        result = await src.lookup(IOCType.IPV4, "1.2.3.4")
+    assert result.verdict is Verdict.MALICIOUS
+    assert result.first_seen is None
+    assert result.last_seen is None
+
+
+@pytest.mark.asyncio
+async def test_missing_url_error_message(http_client: httpx.AsyncClient) -> None:
+    src = MISPSource(http_client, api_key="key", misp_url="")
+    result = await src.lookup(IOCType.IPV4, "1.2.3.4")
+    assert result.error is not None
+    assert "MISP_URL" in result.error
 
 
 @pytest.mark.asyncio

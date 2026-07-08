@@ -34,6 +34,7 @@ from ioc_hunter.engine import Engine
 from ioc_hunter.scorer import IOCVerdict
 from ioc_hunter.sources import (
     AbuseIPDBSource,
+    MISPSource,
     NetMetaSource,
     OTXSource,
     Source,
@@ -81,6 +82,7 @@ def _build_sources(client: httpx.AsyncClient, settings: Settings) -> list[Source
         AbuseIPDBSource(client, api_key=settings.abuseipdb_api_key),
         OTXSource(client, api_key=settings.otx_api_key),
         VirusTotalSource(client, api_key=settings.virustotal_api_key),
+        MISPSource(client, api_key=settings.misp_key, misp_url=settings.misp_url or ""),
     ]
 
 
