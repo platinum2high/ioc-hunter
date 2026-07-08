@@ -70,6 +70,7 @@ async def app_with_fake_engine() -> AsyncIterator[FastAPI]:
         misp_url=None,
         misp_key=None,
         misp_verify_ssl=True,
+        misp_ca_bundle=None,
         cache_ttl=3600,
         cache_dir=Path("/tmp"),
         log_level="INFO",

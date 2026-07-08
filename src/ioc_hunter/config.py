@@ -64,6 +64,7 @@ class Settings:
     misp_url: str | None
     misp_key: str | None
     misp_verify_ssl: bool
+    misp_ca_bundle: str | None
 
     cache_ttl: int
     cache_dir: Path
@@ -82,6 +83,7 @@ class Settings:
             misp_url=_str("MISP_URL"),
             misp_key=_str("MISP_KEY"),
             misp_verify_ssl=_bool("MISP_VERIFY_SSL", default=True),
+            misp_ca_bundle=_str("MISP_CA_BUNDLE"),
             cache_ttl=_int("IOC_CACHE_TTL", _DEFAULT_CACHE_TTL),
             cache_dir=Path(os.getenv("IOC_CACHE_DIR", _DEFAULT_CACHE_DIR)),
             log_level=os.getenv("IOC_LOG_LEVEL", _DEFAULT_LOG_LEVEL),

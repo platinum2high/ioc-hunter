@@ -1,6 +1,7 @@
 """MISP threat-intel source — queries a private MISP instance.
 
-POST /attributes/restSearch
+POST /attributes/restSearch  — attribute lookup with retry
+POST /warninglists/checkValue — false-positive suppression
 Authorization: <api_key>
 Accept: application/json
 """
@@ -8,15 +9,22 @@ Accept: application/json
 from __future__ import annotations
 
 import contextlib
+import re
 import time
 from typing import Any
 
 import httpx
 
+from ioc_hunter._retry import retry_post
 from ioc_hunter.core.types import IOCType
 from ioc_hunter.sources.base import Source, SourceResult, Verdict
 
 _SEARCH_PATH = "/attributes/restSearch"
+_WARNINGLIST_PATH = "/warninglists/checkValue"
+_MISP_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+
+# Matches MITRE ATT&CK technique IDs in Galaxy tag names, e.g. T1566 or T1059.001
+_GALAXY_TTP_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
 
 _MISP_TYPE_MAP: dict[IOCType, list[str]] = {
     IOCType.IPV4: ["ip-dst", "ip-src", "ip-dst|port", "ip-src|port"],
@@ -50,6 +58,13 @@ class MISPSource(Source):
     def is_configured(self) -> bool:
         return bool(self._api_key) and bool(self._misp_url)
 
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": self._api_key or "",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
     async def lookup(self, ioc_type: IOCType, ioc_value: str) -> SourceResult:
         if not self.supports(ioc_type):
             return self._unsupported(ioc_type, ioc_value)
@@ -58,12 +73,6 @@ class MISPSource(Source):
                 return self._error(ioc_type, ioc_value, "misp is not configured (missing MISP_URL)")
             return self._missing_key(ioc_type, ioc_value)
 
-        url = self._misp_url + _SEARCH_PATH
-        headers = {
-            "Authorization": self._api_key or "",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
         payload = {
             "value": ioc_value,
             "type": _MISP_TYPE_MAP[ioc_type],
@@ -72,7 +81,13 @@ class MISPSource(Source):
         }
 
         try:
-            resp = await self._client.post(url, json=payload, headers=headers, timeout=15)
+            resp = await retry_post(
+                self._client,
+                self._misp_url + _SEARCH_PATH,
+                json=payload,
+                headers=self._headers(),
+                timeout=_MISP_TIMEOUT,
+            )
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPError as exc:
@@ -80,7 +95,50 @@ class MISPSource(Source):
         except ValueError as exc:
             return self._error(ioc_type, ioc_value, f"invalid JSON: {exc}")
 
-        return self._interpret(ioc_type, ioc_value, data)
+        result = self._interpret(ioc_type, ioc_value, data)
+
+        if result.verdict in (Verdict.MALICIOUS, Verdict.SUSPICIOUS):
+            wl_name = await self._check_warninglist(ioc_value)
+            if wl_name:
+                return SourceResult(
+                    source=self.name,
+                    ioc_type=ioc_type,
+                    ioc_value=ioc_value,
+                    verdict=Verdict.UNKNOWN,
+                    tags=(*result.tags, f"warninglist:{wl_name}"),
+                    raw=result.raw,
+                )
+
+        return result
+
+    async def _check_warninglist(self, value: str) -> str | None:
+        """Return the warninglist name if value matches any MISP warninglist, else None.
+
+        Failure is intentionally silent — a broken warninglist endpoint must not
+        suppress a legitimate MALICIOUS verdict.
+        """
+        try:
+            resp = await retry_post(
+                self._client,
+                self._misp_url + _WARNINGLIST_PATH,
+                json={"value": value},
+                headers=self._headers(),
+                timeout=_MISP_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            # MISP returns {"<value>": [{"id": ..., "name": ...}]} or [] or {}
+            hits: list[dict] = []
+            if isinstance(data, dict):
+                hits = data.get(value) or []
+            elif isinstance(data, list):
+                hits = data
+            if hits and isinstance(hits[0], dict):
+                return str(hits[0].get("name") or "unknown")
+        except (httpx.HTTPError, ValueError, KeyError, IndexError):
+            pass
+        return None
 
     def _interpret(
         self,
@@ -109,6 +167,10 @@ class MISPSource(Source):
                 name = tag.get("name", "")
                 if name and name not in tags:
                     tags.append(name)
+
+        mitre_ttps: list[str] = list(
+            dict.fromkeys(m for t in tags for m in _GALAXY_TTP_RE.findall(t))
+        )
 
         timestamps: list[int] = []
         for a in attributes:
@@ -139,6 +201,10 @@ class MISPSource(Source):
             verdict = Verdict.SUSPICIOUS
             score = 0.3
 
+        enriched = dict(data)
+        if mitre_ttps:
+            enriched["mitre_techniques"] = mitre_ttps
+
         return SourceResult(
             source=self.name,
             ioc_type=ioc_type,
@@ -149,5 +215,5 @@ class MISPSource(Source):
             first_seen=first_seen,
             last_seen=last_seen,
             references=references,
-            raw=data,
+            raw=enriched,
         )

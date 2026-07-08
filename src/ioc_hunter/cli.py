@@ -135,11 +135,13 @@ def _open_cache(settings: Settings, enabled: bool) -> TICache | None:
 
 @asynccontextmanager
 async def _misp_client(settings: Settings) -> AsyncIterator[httpx.AsyncClient | None]:
-    """Yield a dedicated AsyncClient for MISP (respecting MISP_VERIFY_SSL) when
-    MISP is configured, or None otherwise — so callers never create a wasted
-    connection pool when MISP is not set up."""
+    """Yield a dedicated AsyncClient for MISP when MISP is configured, else None.
+
+    SSL verification order: MISP_CA_BUNDLE path (if set) > MISP_VERIFY_SSL bool.
+    """
     if settings.misp_url and settings.misp_key:
-        async with httpx.AsyncClient(verify=settings.misp_verify_ssl) as client:
+        verify: bool | str = settings.misp_ca_bundle or settings.misp_verify_ssl
+        async with httpx.AsyncClient(verify=verify) as client:
             yield client
     else:
         yield None
@@ -1542,6 +1544,7 @@ _CONFIGURABLE = (
     ("MISP_URL", "MISP instance URL (optional, e.g. https://misp.internal)", ""),
     ("MISP_KEY", "MISP API key (optional)", ""),
     ("MISP_VERIFY_SSL", "MISP SSL verify (true/false, default: true)", ""),
+    ("MISP_CA_BUNDLE", "MISP CA bundle path (optional, for self-signed certs)", ""),
 )
 
 
@@ -1563,6 +1566,31 @@ def _write_env_file(path: Path, values: dict[str, str]) -> None:
     for k, v in values.items():
         lines.append(f"{k}={v}")
     path.write_text("\n".join(lines) + "\n")
+
+
+def _ping_misp(url: str, key: str, ca_bundle: str | None, verify_ssl_raw: str) -> None:
+    """Try GET /users/view/me and print a one-line health status. Non-fatal."""
+    import asyncio as _asyncio
+
+    verify: bool | str = ca_bundle or (verify_ssl_raw.strip().lower() not in {"0", "false", "no", "off"})
+
+    async def _do_ping() -> None:
+        async with httpx.AsyncClient(verify=verify) as c:
+            resp = await c.get(
+                url.rstrip("/") + "/users/view/me",
+                headers={"Authorization": key, "Accept": "application/json"},
+                timeout=httpx.Timeout(10.0, connect=5.0),
+            )
+            if resp.status_code == 200:
+                email = (resp.json().get("User") or {}).get("email", "unknown")
+                console.print(f"[green]✓ MISP reachable[/] — logged in as [bold]{email}[/]")
+            else:
+                console.print(f"[yellow]⚠ MISP returned {resp.status_code}[/] — check URL or API key")
+
+    try:
+        _asyncio.run(_do_ping())
+    except Exception as exc:
+        console.print(f"[yellow]⚠ Could not reach MISP:[/] {exc}")
 
 
 @app.command(help="Interactive setup — collects API keys and writes .env.")
@@ -1594,6 +1622,11 @@ def configure(
 
     _write_env_file(env_path, updated)
     console.print(f"\n[green]Wrote[/] {env_path}")
+
+    misp_url_val = updated.get("MISP_URL", "").strip()
+    misp_key_val = updated.get("MISP_KEY", "").strip()
+    if misp_url_val and misp_key_val:
+        _ping_misp(misp_url_val, misp_key_val, updated.get("MISP_CA_BUNDLE"), updated.get("MISP_VERIFY_SSL", "true"))
 
 
 def _version_callback(value: bool) -> None:

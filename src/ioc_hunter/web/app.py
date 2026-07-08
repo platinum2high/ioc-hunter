@@ -172,6 +172,7 @@ def _build_byok_settings(base: Settings, byok: dict[str, str]) -> Settings:
         misp_url=base.misp_url,
         misp_key=base.misp_key,
         misp_verify_ssl=base.misp_verify_ssl,
+        misp_ca_bundle=base.misp_ca_bundle,
         cache_ttl=base.cache_ttl,
         cache_dir=base.cache_dir,
         log_level=base.log_level,
