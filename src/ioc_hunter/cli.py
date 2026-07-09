@@ -262,10 +262,14 @@ async def _run_check(
 
             if push_misp:
                 if not settings.misp_url or not settings.misp_key:
-                    console.print("[red]--push-misp requires MISP_URL and MISP_KEY — run `ioc-hunter configure`.[/]")
+                    console.print(
+                        "[red]--push-misp requires MISP_URL and MISP_KEY — run `ioc-hunter configure`.[/]"
+                    )
                     return 2
                 if verdict.verdict not in {Verdict.MALICIOUS, Verdict.SUSPICIOUS}:
-                    console.print("[yellow]Verdict is not malicious/suspicious — skipping MISP push.[/]")
+                    console.print(
+                        "[yellow]Verdict is not malicious/suspicious — skipping MISP push.[/]"
+                    )
                 else:
                     publisher = MISPPublisher(
                         settings.misp_url,
@@ -1365,7 +1369,9 @@ async def _run_report(
 
             if push_misp:
                 if not settings.misp_url or not settings.misp_key:
-                    console.print("[red]--push-misp requires MISP_URL and MISP_KEY — run `ioc-hunter configure`.[/]")
+                    console.print(
+                        "[red]--push-misp requires MISP_URL and MISP_KEY — run `ioc-hunter configure`.[/]"
+                    )
                     return 2
                 publisher = MISPPublisher(
                     settings.misp_url,
@@ -1400,7 +1406,9 @@ def report(
         False, "--push-misp", help="Push enriched results to configured MISP instance."
     ),
 ) -> None:
-    exit_code = asyncio.run(_run_report(path, fmt, out, use_cache=not no_cache, push_misp=push_misp))
+    exit_code = asyncio.run(
+        _run_report(path, fmt, out, use_cache=not no_cache, push_misp=push_misp)
+    )
     raise typer.Exit(exit_code)
 
 
@@ -1572,7 +1580,9 @@ def _ping_misp(url: str, key: str, ca_bundle: str | None, verify_ssl_raw: str) -
     """Try GET /users/view/me and print a one-line health status. Non-fatal."""
     import asyncio as _asyncio
 
-    verify: bool | str = ca_bundle or (verify_ssl_raw.strip().lower() not in {"0", "false", "no", "off"})
+    verify: bool | str = ca_bundle or (
+        verify_ssl_raw.strip().lower() not in {"0", "false", "no", "off"}
+    )
 
     async def _do_ping() -> None:
         async with httpx.AsyncClient(verify=verify) as c:
@@ -1585,7 +1595,9 @@ def _ping_misp(url: str, key: str, ca_bundle: str | None, verify_ssl_raw: str) -
                 email = (resp.json().get("User") or {}).get("email", "unknown")
                 console.print(f"[green]✓ MISP reachable[/] — logged in as [bold]{email}[/]")
             else:
-                console.print(f"[yellow]⚠ MISP returned {resp.status_code}[/] — check URL or API key")
+                console.print(
+                    f"[yellow]⚠ MISP returned {resp.status_code}[/] — check URL or API key"
+                )
 
     try:
         _asyncio.run(_do_ping())
@@ -1626,7 +1638,12 @@ def configure(
     misp_url_val = updated.get("MISP_URL", "").strip()
     misp_key_val = updated.get("MISP_KEY", "").strip()
     if misp_url_val and misp_key_val:
-        _ping_misp(misp_url_val, misp_key_val, updated.get("MISP_CA_BUNDLE"), updated.get("MISP_VERIFY_SSL", "true"))
+        _ping_misp(
+            misp_url_val,
+            misp_key_val,
+            updated.get("MISP_CA_BUNDLE"),
+            updated.get("MISP_VERIFY_SSL", "true"),
+        )
 
 
 def _version_callback(value: bool) -> None:

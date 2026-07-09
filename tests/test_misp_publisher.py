@@ -38,6 +38,7 @@ def _existing_attr(uuid: str = "attr-uuid-111") -> dict:
 
 # --- Basic event creation (no existing attributes) ---
 
+
 @pytest.mark.asyncio
 async def test_push_creates_event_and_returns_uuid(http_client: httpx.AsyncClient) -> None:
     publisher = MISPPublisher(_BASE, "key", client=http_client)
@@ -102,6 +103,7 @@ async def test_push_custom_event_info(http_client: httpx.AsyncClient) -> None:
 
 # --- Sighting when IOC already exists ---
 
+
 @pytest.mark.asyncio
 async def test_sighting_added_when_attribute_exists(http_client: httpx.AsyncClient) -> None:
     publisher = MISPPublisher(_BASE, "key", client=http_client)
@@ -122,9 +124,7 @@ async def test_no_new_event_when_sighting_added(http_client: httpx.AsyncClient) 
     publisher = MISPPublisher(_BASE, "key", client=http_client)
     # assert_all_called=False: events route registered but should NOT be called
     with respx.mock(assert_all_called=False) as router:
-        router.post(_SEARCH_URL).mock(
-            return_value=httpx.Response(200, json=_existing_attr())
-        )
+        router.post(_SEARCH_URL).mock(return_value=httpx.Response(200, json=_existing_attr()))
         router.post(f"{_SIGHTING_URL_PREFIX}attr-uuid-111").mock(
             return_value=httpx.Response(200, json={})
         )
@@ -164,6 +164,7 @@ async def test_mixed_push_sighting_and_new_event(http_client: httpx.AsyncClient)
 
 # --- Retry ---
 
+
 @pytest.mark.asyncio
 async def test_event_creation_retries_on_503(http_client: httpx.AsyncClient) -> None:
     publisher = MISPPublisher(_BASE, "key", client=http_client)
@@ -191,8 +192,6 @@ async def test_sighting_failure_is_non_fatal(http_client: httpx.AsyncClient) -> 
         router.post(_SEARCH_URL).mock(
             return_value=httpx.Response(200, json=_existing_attr("attr-uuid-fail"))
         )
-        router.post(f"{_SIGHTING_URL_PREFIX}attr-uuid-fail").mock(
-            return_value=httpx.Response(500)
-        )
+        router.post(f"{_SIGHTING_URL_PREFIX}attr-uuid-fail").mock(return_value=httpx.Response(500))
         result = await publisher.push([_verdict()])
     assert "sighting" in result.lower()

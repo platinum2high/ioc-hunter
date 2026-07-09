@@ -74,9 +74,7 @@ async def test_suspicious_on_no_to_ids(http_client: httpx.AsyncClient) -> None:
 async def test_unknown_on_empty_attributes(http_client: httpx.AsyncClient) -> None:
     src = MISPSource(http_client, api_key="key", misp_url=_BASE)
     with respx.mock() as router:
-        router.post(_SEARCH_URL).mock(
-            return_value=httpx.Response(200, json=_response([]))
-        )
+        router.post(_SEARCH_URL).mock(return_value=httpx.Response(200, json=_response([])))
         result = await src.lookup(IOCType.IPV4, "1.2.3.4")
     assert result.verdict is Verdict.UNKNOWN
 
@@ -160,9 +158,7 @@ async def test_score_caps_at_1(http_client: httpx.AsyncClient) -> None:
     src = MISPSource(http_client, api_key="key", misp_url=_BASE)
     many_attrs = [_attr(to_ids=True, event_id=str(i)) for i in range(10)]
     with respx.mock() as router:
-        router.post(_SEARCH_URL).mock(
-            return_value=httpx.Response(200, json=_response(many_attrs))
-        )
+        router.post(_SEARCH_URL).mock(return_value=httpx.Response(200, json=_response(many_attrs)))
         router.post(_WARNLIST_URL).mock(return_value=_WL_EMPTY)
         result = await src.lookup(IOCType.IPV4, "1.2.3.4")
     assert result.score <= 1.0
@@ -174,9 +170,7 @@ async def test_non_numeric_timestamp_does_not_crash(http_client: httpx.AsyncClie
     src = MISPSource(http_client, api_key="key", misp_url=_BASE)
     bad_attr = _attr(timestamp="N/A")
     with respx.mock() as router:
-        router.post(_SEARCH_URL).mock(
-            return_value=httpx.Response(200, json=_response([bad_attr]))
-        )
+        router.post(_SEARCH_URL).mock(return_value=httpx.Response(200, json=_response([bad_attr])))
         router.post(_WARNLIST_URL).mock(return_value=_WL_EMPTY)
         result = await src.lookup(IOCType.IPV4, "1.2.3.4")
     assert result.verdict is Verdict.MALICIOUS
@@ -208,6 +202,7 @@ async def test_domain_lookup(http_client: httpx.AsyncClient) -> None:
 
 
 # --- Retry ---
+
 
 @pytest.mark.asyncio
 async def test_retries_on_503_then_succeeds(http_client: httpx.AsyncClient) -> None:
@@ -244,8 +239,11 @@ async def test_all_503_returns_error(http_client: httpx.AsyncClient) -> None:
 
 # --- Warninglist ---
 
+
 @pytest.mark.asyncio
-async def test_warninglist_hit_downgrades_malicious_to_unknown(http_client: httpx.AsyncClient) -> None:
+async def test_warninglist_hit_downgrades_malicious_to_unknown(
+    http_client: httpx.AsyncClient,
+) -> None:
     src = MISPSource(http_client, api_key="key", misp_url=_BASE)
     with respx.mock() as router:
         router.post(_SEARCH_URL).mock(
@@ -263,15 +261,15 @@ async def test_warninglist_hit_downgrades_malicious_to_unknown(http_client: http
 
 
 @pytest.mark.asyncio
-async def test_warninglist_failure_does_not_suppress_verdict(http_client: httpx.AsyncClient) -> None:
+async def test_warninglist_failure_does_not_suppress_verdict(
+    http_client: httpx.AsyncClient,
+) -> None:
     src = MISPSource(http_client, api_key="key", misp_url=_BASE)
     with respx.mock() as router:
         router.post(_SEARCH_URL).mock(
             return_value=httpx.Response(200, json=_response([_attr(to_ids=True)]))
         )
-        router.post(f"{_BASE}/warninglists/checkValue").mock(
-            return_value=httpx.Response(500)
-        )
+        router.post(f"{_BASE}/warninglists/checkValue").mock(return_value=httpx.Response(500))
         result = await src.lookup(IOCType.IPV4, "1.2.3.4")
     assert result.verdict is Verdict.MALICIOUS
 
@@ -292,6 +290,7 @@ async def test_warninglist_empty_response_keeps_verdict(http_client: httpx.Async
 
 # --- MITRE ATT&CK TTPs from Galaxy tags ---
 
+
 @pytest.mark.asyncio
 async def test_galaxy_tags_extract_mitre_ttps(http_client: httpx.AsyncClient) -> None:
     src = MISPSource(http_client, api_key="key", misp_url=_BASE)
@@ -304,9 +303,7 @@ async def test_galaxy_tags_extract_mitre_ttps(http_client: httpx.AsyncClient) ->
         ],
     )
     with respx.mock() as router:
-        router.post(_SEARCH_URL).mock(
-            return_value=httpx.Response(200, json=_response([attr]))
-        )
+        router.post(_SEARCH_URL).mock(return_value=httpx.Response(200, json=_response([attr])))
         router.post(f"{_BASE}/warninglists/checkValue").mock(
             return_value=httpx.Response(200, json={})
         )

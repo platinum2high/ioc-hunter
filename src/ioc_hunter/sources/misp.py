@@ -147,9 +147,7 @@ class MISPSource(Source):
         data: dict[str, Any],
     ) -> SourceResult:
         attributes: list[dict] = (
-            (data.get("response") or {}).get("Attribute")
-            or data.get("Attribute")
-            or []
+            (data.get("response") or {}).get("Attribute") or data.get("Attribute") or []
         )
 
         if not attributes:
@@ -190,9 +188,7 @@ class MISPSource(Source):
         )
 
         event_ids = {a["event_id"] for a in attributes if a.get("event_id")}
-        references = tuple(
-            f"{self._misp_url}/events/view/{eid}" for eid in sorted(event_ids)
-        )
+        references = tuple(f"{self._misp_url}/events/view/{eid}" for eid in sorted(event_ids))
 
         if malicious_count > 0:
             verdict = Verdict.MALICIOUS

@@ -812,7 +812,7 @@ Point ioc-hunter at your own MISP instance to query your private threat intellig
 ```bash
 # Add to .env or run `ioc-hunter configure`
 MISP_URL=https://misp.internal
-MISP_KEY=<your-api-key>
+MISP_KEY=paste_your_api_key_here
 MISP_VERIFY_SSL=true          # set false for self-signed certs
 MISP_CA_BUNDLE=/path/ca.crt  # optional: custom CA bundle
 ```
