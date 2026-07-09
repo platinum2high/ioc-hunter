@@ -8,7 +8,7 @@
 [![CI](https://github.com/platinum2high/ioc-hunter/actions/workflows/ci.yml/badge.svg)](https://github.com/platinum2high/ioc-hunter/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-653%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-734%20passing-brightgreen)
 
 ---
 
@@ -48,7 +48,7 @@ they don't crash, just gracefully skip.
 | --- | --- | --- |
 | Input | one IOC at a time | drag in a whole report, paste `.eml`, or tail a live log |
 | Defang-aware | usually no | `evil[.]com`, `hxxp://`, `[at]` all understood |
-| Sources | 1 (usually VT) | 7 in parallel: VT, AbuseIPDB, OTX, URLhaus, ThreatFox, Tor exit, NetMeta |
+| Sources | 1 (usually VT) | 8 in parallel: VT, AbuseIPDB, OTX, URLhaus, ThreatFox, Tor exit, NetMeta, **MISP** |
 | Phishing triage | none | `.eml` parser: From/Reply-To mismatch, Received chain, attachment hashes |
 | Live monitoring | none | `watch` mode — tail a log, alert on suspicious IOCs in real time |
 | Scoring | bad/good | transparent weighted model with per-source contribution |
@@ -101,6 +101,7 @@ will run. To unlock the other 5 feeds, all free:
 | **AbuseIPDB** | <https://www.abuseipdb.com/register> | IPv4/IPv6 reputation |
 | **AlienVault OTX** | <https://otx.alienvault.com/> | IPs, domains, URLs, hashes, CVEs |
 | **VirusTotal** | <https://www.virustotal.com/> | IPs, domains, URLs, hashes |
+| **MISP** (optional, self-hosted) | your own instance | IPs, domains, URLs, hashes, emails — plus warninglist suppression and `--push-misp` |
 
 Registration on each is ~30 seconds. Then run the interactive setup:
 
@@ -802,6 +803,39 @@ flowchart LR
 | VirusTotal | API key (free 4/min) | IPv4, IPv6, domain, URL, file | 0.90 |
 | Tor exit list | **none** | IPv4, IPv6 | 0.40 |
 | NetMeta (offline) | **none** | IPv4, IPv6 | 0.20 |
+| **MISP** | `MISP_URL` + `MISP_KEY` | IPv4, IPv6, domain, URL, email, MD5, SHA1, SHA256 | 1.00 |
+
+### MISP integration
+
+Point ioc-hunter at your own MISP instance to query your private threat intelligence alongside the public feeds.
+
+```bash
+# Add to .env or run `ioc-hunter configure`
+MISP_URL=https://misp.internal
+MISP_KEY=<your-api-key>
+MISP_VERIFY_SSL=true          # set false for self-signed certs
+MISP_CA_BUNDLE=/path/ca.crt  # optional: custom CA bundle
+```
+
+`ioc-hunter configure` pings `GET /users/view/me` after saving and prints the login email, so you know immediately if the key works.
+
+**What MISP adds:**
+
+- **Warninglist suppression** — if an IOC matches a MISP warninglist (RFC 1918 ranges, CDNs, Alexa top-1M, etc.) the verdict is downgraded to UNKNOWN and a `warninglist:<name>` tag is added, cutting false positives from internal network ranges.
+- **ATT&CK TTPs** — Galaxy tag names (e.g. `misp-galaxy:mitre-attack-pattern="T1566"`) are parsed and surfaced as-is in the per-source tag list.
+- **Push to MISP** — `--push-misp` on `check` or `report` sends results back to your instance. Smart dedup: if the IOC already exists in MISP a **sighting** is recorded instead of creating a duplicate event.
+
+```bash
+ioc-hunter check 1.2.3.4 --push-misp --no-cache
+# MALICIOUS  confidence 85%
+# ...
+# Pushed to MISP: sightings added (1 IOC(s))   ← already existed, sighting recorded
+
+ioc-hunter check evil.ru --push-misp --no-cache
+# MALICIOUS  confidence 91%
+# ...
+# Pushed to MISP: event 3fa85f64-...            ← new IOC, event created
+```
 
 Adding a source is one file: subclass `Source`, implement `async lookup()`,
 import in `sources/__init__.py`. See `sources/tor_exit.py` for the
@@ -836,8 +870,9 @@ All planned phases done.
 | 14.3b — JA3S + SMB/NTLM (NetNTLMv2 capture) + Kerberos (Kerberoast / AS-REP roast) + TLS anomalies + **recursive archive scan** | ✅ |
 | 14.4 — **EVTX Windows Event Log analyzer**: zero-dependency BinXML parser + 25+ ATT&CK-mapped detection rules (Kerberoasting, brute-force, lateral movement, LOLBins, persistence, defence evasion) | ✅ |
 | 14.5 — **LNK Windows Shortcut analyzer**: MS-SHLLINK parser, encoded-PowerShell decode, masquerade / evasion / overlay detection, builder provenance (machine ID + MAC) | ✅ |
+| 15 — **MISP integration**: private-instance lookup + warninglist suppression + ATT&CK TTP extraction + smart push (sighting vs event) + CA bundle + configure health-check | ✅ |
 
-**703 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
+**734 tests, all green.** CI runs the full matrix (Python 3.11 + 3.12),
 Docker build, `ruff` lint + format check, and `gitleaks` secret scan on
 every push.
 
