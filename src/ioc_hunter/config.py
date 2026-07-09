@@ -44,6 +44,13 @@ def _load_dotenv_once() -> None:
         load_dotenv(env_path, override=False)
 
 
+def _bool(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """All runtime configuration in one frozen bag."""
@@ -53,6 +60,11 @@ class Settings:
     otx_api_key: str | None
     virustotal_api_key: str | None
     shodan_api_key: str | None
+
+    misp_url: str | None
+    misp_key: str | None
+    misp_verify_ssl: bool
+    misp_ca_bundle: str | None
 
     cache_ttl: int
     cache_dir: Path
@@ -68,6 +80,10 @@ class Settings:
             otx_api_key=_str("OTX_API_KEY"),
             virustotal_api_key=_str("VIRUSTOTAL_API_KEY"),
             shodan_api_key=_str("SHODAN_API_KEY"),
+            misp_url=_str("MISP_URL"),
+            misp_key=_str("MISP_KEY"),
+            misp_verify_ssl=_bool("MISP_VERIFY_SSL", default=True),
+            misp_ca_bundle=_str("MISP_CA_BUNDLE"),
             cache_ttl=_int("IOC_CACHE_TTL", _DEFAULT_CACHE_TTL),
             cache_dir=Path(os.getenv("IOC_CACHE_DIR", _DEFAULT_CACHE_DIR)),
             log_level=os.getenv("IOC_LOG_LEVEL", _DEFAULT_LOG_LEVEL),

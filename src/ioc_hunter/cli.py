@@ -16,6 +16,8 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -46,10 +48,12 @@ from ioc_hunter.decoder import decode as _decode_op
 from ioc_hunter.decoder import magic as _magic
 from ioc_hunter.engine import Engine
 from ioc_hunter.exporters import to_json, to_markdown, to_misp, to_stix
+from ioc_hunter.misp_publisher import MISPPublisher, MISPPublishError
 from ioc_hunter.rules import to_sigma, to_suricata
 from ioc_hunter.scorer import IOCVerdict
 from ioc_hunter.sources import (
     AbuseIPDBSource,
+    MISPSource,
     NetMetaSource,
     OTXSource,
     Source,
@@ -84,10 +88,15 @@ _VERDICT_STYLES: dict[Verdict, tuple[str, str]] = {
 }
 
 
-def _build_sources(client: httpx.AsyncClient, settings: Settings) -> list[Source]:
+def _build_sources(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    *,
+    misp_client: httpx.AsyncClient | None = None,
+) -> list[Source]:
     """Instantiate every source. Sources without a key stay registered but
     will short-circuit to UNKNOWN with an error explaining why."""
-    return [
+    sources: list[Source] = [
         NetMetaSource(client),
         TorExitSource(client),
         URLhausSource(client, api_key=settings.abuse_ch_auth_key),
@@ -95,16 +104,24 @@ def _build_sources(client: httpx.AsyncClient, settings: Settings) -> list[Source
         AbuseIPDBSource(client, api_key=settings.abuseipdb_api_key),
         OTXSource(client, api_key=settings.otx_api_key),
         VirusTotalSource(client, api_key=settings.virustotal_api_key),
+        MISPSource(
+            misp_client or client,
+            api_key=settings.misp_key,
+            misp_url=settings.misp_url or "",
+        ),
     ]
+    return sources
 
 
 def _build_engine(
     client: httpx.AsyncClient,
     settings: Settings,
     cache: TICache | None,
+    *,
+    misp_client: httpx.AsyncClient | None = None,
 ) -> Engine:
     return Engine(
-        _build_sources(client, settings),
+        _build_sources(client, settings, misp_client=misp_client),
         cache=cache,
         max_concurrency=settings.max_concurrency,
     )
@@ -114,6 +131,20 @@ def _open_cache(settings: Settings, enabled: bool) -> TICache | None:
     if not enabled:
         return None
     return TICache(settings.cache_dir / "ioc_hunter.db", default_ttl=settings.cache_ttl)
+
+
+@asynccontextmanager
+async def _misp_client(settings: Settings) -> AsyncIterator[httpx.AsyncClient | None]:
+    """Yield a dedicated AsyncClient for MISP when MISP is configured, else None.
+
+    SSL verification order: MISP_CA_BUNDLE path (if set) > MISP_VERIFY_SSL bool.
+    """
+    if settings.misp_url and settings.misp_key:
+        verify: bool | str = settings.misp_ca_bundle or settings.misp_verify_ssl
+        async with httpx.AsyncClient(verify=verify) as client:
+            yield client
+    else:
+        yield None
 
 
 def _parse_ioc(value: str, type_hint: str | None) -> IOC | None:
@@ -201,7 +232,12 @@ def _render_batch_table(verdicts: list[IOCVerdict]) -> None:
     console.print(table)
 
 
-async def _run_check(value: str, type_hint: str | None, use_cache: bool) -> int:
+async def _run_check(
+    value: str,
+    type_hint: str | None,
+    use_cache: bool,
+    push_misp: bool,
+) -> int:
     ioc = _parse_ioc(value, type_hint)
     if ioc is None:
         console.print(f"[red]Could not detect IOC type for:[/] {value}")
@@ -211,21 +247,41 @@ async def _run_check(value: str, type_hint: str | None, use_cache: bool) -> int:
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             active = engine.active_sources
             if not active:
                 console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
                 return 2
             with console.status(f"Querying {len(active)} source(s) for {_safe(ioc.value)}..."):
                 verdict = await engine.lookup_one(ioc)
+
+            _render_verdict_panel(verdict)
+            _render_per_source_table(verdict)
+            _render_extras(verdict)
+
+            if push_misp:
+                if not settings.misp_url or not settings.misp_key:
+                    console.print("[red]--push-misp requires MISP_URL and MISP_KEY — run `ioc-hunter configure`.[/]")
+                    return 2
+                if verdict.verdict not in {Verdict.MALICIOUS, Verdict.SUSPICIOUS}:
+                    console.print("[yellow]Verdict is not malicious/suspicious — skipping MISP push.[/]")
+                else:
+                    publisher = MISPPublisher(
+                        settings.misp_url,
+                        settings.misp_key,
+                        client=mc or client,
+                    )
+                    with console.status("Pushing to MISP..."):
+                        try:
+                            uuid = await publisher.push([verdict])
+                            console.print(f"[green]Pushed to MISP:[/] [bold]{uuid}[/]")
+                        except MISPPublishError as exc:
+                            console.print(f"[red]MISP push failed:[/] {exc}")
+                            return 3
     finally:
         if cache is not None:
             cache.close()
-
-    _render_verdict_panel(verdict)
-    _render_per_source_table(verdict)
-    _render_extras(verdict)
     return 0
 
 
@@ -240,8 +296,8 @@ async def _run_scan_file(path: Path, use_cache: bool) -> int:
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             active = engine.active_sources
             if not active:
                 console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
@@ -263,8 +319,11 @@ def check(
         None, "--type", "-t", help="Override auto-detection (ipv4, domain, ...)."
     ),
     no_cache: bool = typer.Option(False, "--no-cache", help="Skip the SQLite cache."),
+    push_misp: bool = typer.Option(
+        False, "--push-misp", help="Push malicious/suspicious result to configured MISP instance."
+    ),
 ) -> None:
-    exit_code = asyncio.run(_run_check(ioc, type_hint, use_cache=not no_cache))
+    exit_code = asyncio.run(_run_check(ioc, type_hint, use_cache=not no_cache, push_misp=push_misp))
     raise typer.Exit(exit_code)
 
 
@@ -356,8 +415,8 @@ async def _run_parse_eml(path: Path, enrich: bool, use_cache: bool) -> int:
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             active = engine.active_sources
             if not active:
                 console.print("[yellow]No active TI sources — run `ioc-hunter configure`.[/]")
@@ -1099,8 +1158,8 @@ async def _run_analyze(
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             if not engine.active_sources:
                 console.print(
                     "\n[yellow]No active TI sources — skipping IOC enrichment.[/]  "
@@ -1124,8 +1183,8 @@ async def _enrich_for_json(iocs, *, use_cache: bool):
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             if not engine.active_sources:
                 return []
             return await engine.lookup_many(iocs)
@@ -1208,8 +1267,8 @@ async def _run_watch(
         )
     )
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             if not engine.active_sources:
                 console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
                 return 2
@@ -1274,6 +1333,7 @@ async def _run_report(
     fmt: str,
     out: Path | None,
     use_cache: bool,
+    push_misp: bool,
 ) -> int:
     if fmt not in _EXPORTERS:
         choices = ", ".join(sorted(set(_EXPORTERS)))
@@ -1288,23 +1348,40 @@ async def _run_report(
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             if not engine.active_sources:
                 console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
                 return 2
             with console.status(f"Enriching {len(iocs)} IOC(s) for {fmt} report..."):
                 verdicts = await engine.lookup_many(iocs)
+
+            rendered = _EXPORTERS[fmt](verdicts)
+            if out is None:
+                print(rendered)
+            else:
+                out.write_text(rendered)
+                console.print(f"[green]Wrote[/] {out} ({len(rendered)} bytes)")
+
+            if push_misp:
+                if not settings.misp_url or not settings.misp_key:
+                    console.print("[red]--push-misp requires MISP_URL and MISP_KEY — run `ioc-hunter configure`.[/]")
+                    return 2
+                publisher = MISPPublisher(
+                    settings.misp_url,
+                    settings.misp_key,
+                    client=mc or client,
+                )
+                with console.status("Pushing to MISP..."):
+                    try:
+                        uuid = await publisher.push(verdicts)
+                        console.print(f"[green]Pushed to MISP:[/] [bold]{uuid}[/]")
+                    except MISPPublishError as exc:
+                        console.print(f"[red]MISP push failed:[/] {exc}")
+                        return 3
     finally:
         if cache is not None:
             cache.close()
-
-    rendered = _EXPORTERS[fmt](verdicts)
-    if out is None:
-        print(rendered)
-    else:
-        out.write_text(rendered)
-        console.print(f"[green]Wrote[/] {out} ({len(rendered)} bytes)")
     return 0
 
 
@@ -1319,8 +1396,11 @@ def report(
     ),
     out: Path | None = typer.Option(None, "--out", "-o", help="Write to file instead of stdout."),
     no_cache: bool = typer.Option(False, "--no-cache", help="Skip the SQLite cache."),
+    push_misp: bool = typer.Option(
+        False, "--push-misp", help="Push enriched results to configured MISP instance."
+    ),
 ) -> None:
-    exit_code = asyncio.run(_run_report(path, fmt, out, use_cache=not no_cache))
+    exit_code = asyncio.run(_run_report(path, fmt, out, use_cache=not no_cache, push_misp=push_misp))
     raise typer.Exit(exit_code)
 
 
@@ -1334,8 +1414,8 @@ async def _run_correlate(path: Path, use_cache: bool) -> int:
     settings = Settings.from_env()
     cache = _open_cache(settings, use_cache)
     try:
-        async with httpx.AsyncClient() as client:
-            engine = _build_engine(client, settings, cache)
+        async with httpx.AsyncClient() as client, _misp_client(settings) as mc:
+            engine = _build_engine(client, settings, cache, misp_client=mc)
             if not engine.active_sources:
                 console.print("[red]No active sources — run `ioc-hunter configure`.[/]")
                 return 2
@@ -1461,6 +1541,10 @@ _CONFIGURABLE = (
         "https://www.virustotal.com/",
     ),
     ("SHODAN_API_KEY", "Shodan (optional)", "https://account.shodan.io/"),
+    ("MISP_URL", "MISP instance URL (optional, e.g. https://misp.internal)", ""),
+    ("MISP_KEY", "MISP API key (optional)", ""),
+    ("MISP_VERIFY_SSL", "MISP SSL verify (true/false, default: true)", ""),
+    ("MISP_CA_BUNDLE", "MISP CA bundle path (optional, for self-signed certs)", ""),
 )
 
 
@@ -1482,6 +1566,31 @@ def _write_env_file(path: Path, values: dict[str, str]) -> None:
     for k, v in values.items():
         lines.append(f"{k}={v}")
     path.write_text("\n".join(lines) + "\n")
+
+
+def _ping_misp(url: str, key: str, ca_bundle: str | None, verify_ssl_raw: str) -> None:
+    """Try GET /users/view/me and print a one-line health status. Non-fatal."""
+    import asyncio as _asyncio
+
+    verify: bool | str = ca_bundle or (verify_ssl_raw.strip().lower() not in {"0", "false", "no", "off"})
+
+    async def _do_ping() -> None:
+        async with httpx.AsyncClient(verify=verify) as c:
+            resp = await c.get(
+                url.rstrip("/") + "/users/view/me",
+                headers={"Authorization": key, "Accept": "application/json"},
+                timeout=httpx.Timeout(10.0, connect=5.0),
+            )
+            if resp.status_code == 200:
+                email = (resp.json().get("User") or {}).get("email", "unknown")
+                console.print(f"[green]✓ MISP reachable[/] — logged in as [bold]{email}[/]")
+            else:
+                console.print(f"[yellow]⚠ MISP returned {resp.status_code}[/] — check URL or API key")
+
+    try:
+        _asyncio.run(_do_ping())
+    except Exception as exc:
+        console.print(f"[yellow]⚠ Could not reach MISP:[/] {exc}")
 
 
 @app.command(help="Interactive setup — collects API keys and writes .env.")
@@ -1513,6 +1622,11 @@ def configure(
 
     _write_env_file(env_path, updated)
     console.print(f"\n[green]Wrote[/] {env_path}")
+
+    misp_url_val = updated.get("MISP_URL", "").strip()
+    misp_key_val = updated.get("MISP_KEY", "").strip()
+    if misp_url_val and misp_key_val:
+        _ping_misp(misp_url_val, misp_key_val, updated.get("MISP_CA_BUNDLE"), updated.get("MISP_VERIFY_SSL", "true"))
 
 
 def _version_callback(value: bool) -> None:
