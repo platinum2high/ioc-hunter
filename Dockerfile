@@ -3,7 +3,7 @@
 # IOC Hunter — multi-stage build for a minimal, non-root runtime image.
 # =============================================================================
 
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 WORKDIR /build
 
@@ -16,7 +16,7 @@ RUN pip wheel --no-cache-dir --wheel-dir /wheels .
 
 # -----------------------------------------------------------------------------
 
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 LABEL org.opencontainers.image.title="ioc-hunter"
 LABEL org.opencontainers.image.description="Async threat intelligence correlation engine."
