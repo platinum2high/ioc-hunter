@@ -50,7 +50,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       - name: Build CLI image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -59,7 +59,7 @@ jobs:
           cache-from: type=gha,scope=cli
           cache-to: type=gha,mode=max,scope=cli
       - name: Build web image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile.web
