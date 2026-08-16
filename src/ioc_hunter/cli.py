@@ -71,6 +71,15 @@ app = typer.Typer(
     help="Async threat intelligence correlation engine for SOC analysts.",
     no_args_is_help=True,
     rich_markup_mode="rich",
+    epilog=(
+        "Examples:\n\n"
+        "  ioc-hunter check 1.2.3.4\n\n"
+        "  ioc-hunter scan-file phishing-report.txt\n\n"
+        "  ioc-hunter analyze suspicious.exe\n\n"
+        "  ioc-hunter parse-eml sample.eml\n\n"
+        "  ioc-hunter watch /var/log/proxy.log --threshold suspicious\n\n"
+        "Docs: https://github.com/platinum2high/ioc-hunter"
+    ),
 )
 console = Console()
 
@@ -316,7 +325,15 @@ async def _run_scan_file(path: Path, use_cache: bool) -> int:
     return 0
 
 
-@app.command(help="Look up a single IOC across every configured source.")
+@app.command(
+    help="Look up a single IOC across every configured source.",
+    epilog=(
+        "Examples:\n\n"
+        "  ioc-hunter check evil.com\n\n"
+        "  ioc-hunter check 1.2.3.4 --type ipv4 --no-cache\n\n"
+        "  ioc-hunter check evil.com --push-misp"
+    ),
+)
 def check(
     ioc: str = typer.Argument(..., help="The indicator to look up (auto-detected)."),
     type_hint: str | None = typer.Option(
@@ -1203,6 +1220,12 @@ async def _enrich_for_json(iocs, *, use_cache: bool):
         "Deep static analysis of a binary (PE / ELF / Mach-O), document "
         "(PDF / OOXML / OLE / RTF), or network capture (PCAP / PCAPNG)."
     ),
+    epilog=(
+        "Examples:\n\n"
+        "  ioc-hunter analyze sample.exe\n\n"
+        "  ioc-hunter analyze capture.pcap --strings\n\n"
+        "  ioc-hunter analyze invoice.docx --no-enrich --json"
+    ),
 )
 def analyze_cmd(
     path: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, resolve_path=True),
@@ -1391,7 +1414,15 @@ async def _run_report(
     return 0
 
 
-@app.command(help="Enrich a file of IOCs and render JSON / Markdown / STIX / MISP.")
+@app.command(
+    help="Enrich a file of IOCs and render JSON / Markdown / STIX / MISP.",
+    epilog=(
+        "Examples:\n\n"
+        "  ioc-hunter report iocs.txt --format sigma --out rule.yml\n\n"
+        "  ioc-hunter report iocs.txt --format stix\n\n"
+        "  ioc-hunter report iocs.txt --format misp --push-misp"
+    ),
+)
 def report(
     path: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, resolve_path=True),
     fmt: str = typer.Option(

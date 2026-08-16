@@ -9,6 +9,11 @@
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Tests](https://img.shields.io/badge/tests-734%20passing-brightgreen)
+[![Try the web demo](https://img.shields.io/badge/try%20it-web%20demo-orange)](#-try-it-in-the-browser--no-install)
+
+<p align="center">
+  <img src="docs/screenshots/demo.gif" alt="ioc-hunter check / scan-file / parse-eml / analyze in action" width="760">
+</p>
 
 ---
 
@@ -715,19 +720,20 @@ Every push to `main` redeploys automatically. Health endpoint at
 ```mermaid
 flowchart LR
     %% Node Definitions
-    IOC[IOC String]
-    Parser[Defang Aware Parser]
-    Cache[SQLite Cache]
+    Input[/"IOC text · .eml · log tail\nPE / ELF / Mach-O\nPDF / OOXML / OLE / RTF\nPCAP / EVTX / LNK / archives"/]
+    Parser["Defang-aware Parser"]
+    Analyzer["Static Analyzer<br/>analyze/"]
+    Cache[("SQLite TTL Cache")]
 
-    subgraph Enrichment [IOC Enrichment]
+    subgraph Enrichment ["IOC Enrichment — engine.py"]
         direction TB
-        Orchestrator[TI Feeds]
-        Compiler[Compiler]
+        Orchestrator[Async Orchestrator]
+        Compiler[Result Compiler]
 
         Orchestrator --> URLHaus[URLhaus]
         Orchestrator --> OTX[OTX]
-        Orchestrator --> VT[VT]
-        Orchestrator --> More[...]
+        Orchestrator --> VT[VirusTotal]
+        Orchestrator --> More["AbuseIPDB / ThreatFox<br/>Tor exit / NetMeta / MISP"]
 
         URLHaus --> Compiler
         OTX --> Compiler
@@ -736,44 +742,40 @@ flowchart LR
     end
 
     Scorer[Weighted Scorer]
-    Correlator[Correlator]
+    Correlator["Correlator<br/>shared-subnet / shared-tag"]
 
-    subgraph Output [Outputs]
+    subgraph Output ["Output — exporters/ + rules/"]
         direction TB
-        Result
+        Result[Verdict + Report]
 
-        subgraph Exporters [Data Exporters]
+        subgraph Exporters ["Data Exporters"]
             JSON[JSON]
             MD[Markdown]
-            STIX[STIX]
-            MISP[MISP]
+            STIX[STIX 2.1]
+            MISP[MISP Event]
         end
 
-        subgraph RuleGen [Rule Generation]
+        subgraph RuleGen ["Rule Generation"]
             Sigma[Sigma]
             Suricata[Suricata]
         end
-
-        Dashboard[TUI Dashboard]
     end
 
     %% Flow Connections
-    IOC --> Parser
-    Parser --> |Check Cache| Cache
+    Input -->|IOC / text / .eml| Parser
+    Input -->|binary / doc / pcap / evtx / lnk| Analyzer
+    Analyzer -->|embedded IOCs| Parser
+    Parser -->|check cache| Cache
 
-    Cache -->|Hit| Output
-    Cache -->|Miss| Orchestrator
+    Cache -->|hit| Result
+    Cache -->|miss| Orchestrator
 
     Compiler --> Scorer
     Scorer --> Correlator
     Correlator --> Result
-    Result -->|Store| Cache
+    Result -->|store| Cache
     Result --> Exporters
     Result --> RuleGen
-    Result --> Dashboard
-
-    %% Styling
-    style IOC fill:none,stroke:none,font-weight:bold
 ```
 
 | Module | Role |
